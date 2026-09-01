@@ -15,6 +15,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.cloudrecorder.phase2.ui.CloudRecorderTheme
 import com.cloudrecorder.phase2.ui.RecorderScreen
 import com.cloudrecorder.phase2.upload.DriveAuthManager
 import com.cloudrecorder.phase2.upload.NetworkMonitor
@@ -70,12 +71,14 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            RecorderScreen(
-                hasPermissions = permissionsGranted,
-                onRequestPermissions = { permissionLauncher.launch(requiredPermissions()) },
-                onSignIn = { signInLauncher.launch(DriveAuthManager.signInClient(this).signInIntent) },
-                onProjectNameChanged = { ProjectPrefs.save(this, it) },
-            )
+            CloudRecorderTheme {
+                RecorderScreen(
+                    hasPermissions = permissionsGranted,
+                    onRequestPermissions = { permissionLauncher.launch(requiredPermissions()) },
+                    onSignIn = { signInLauncher.launch(DriveAuthManager.signInClient(this).signInIntent) },
+                    onProjectNameChanged = { ProjectPrefs.save(this, it) },
+                )
+            }
         }
     }
 
