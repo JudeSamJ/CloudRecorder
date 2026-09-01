@@ -27,7 +27,7 @@ object DriveAuthManager {
     const val SCOPE_DRIVE_FILE = "https://www.googleapis.com/auth/drive.file"
 
     class NotSignedInException : Exception("Not signed in to Google")
-    class RecoverableAuthException(val intent: Intent) : Exception("Re-authentication required")
+    class RecoverableAuthException(val intent: Intent?) : Exception("Re-authentication required")
 
     fun signInClient(context: Context): GoogleSignInClient {
         val options = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)

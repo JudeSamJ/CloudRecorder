@@ -100,8 +100,13 @@ class RecordingService : LifecycleService() {
         createNotificationChannel()
     }
 
-    override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        // The platform can redeliver onStartCommand with a null intent (e.g. after
+        // the system restarts the service); we don't request a sticky restart
+        // (START_NOT_STICKY below) specifically so this shouldn't happen in
+        // practice, but guard it anyway rather than crash on a null deref.
+        if (intent == null) return START_NOT_STICKY
         when (intent.action) {
             ACTION_START -> handleStartAction(intent)
             ACTION_STOP -> requestFullStop("user_requested")
