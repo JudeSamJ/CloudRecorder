@@ -26,6 +26,7 @@ both just call the same pipeline.reconstruction/proxy_generation modules against
 the same Drive state.
 """
 
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -297,6 +298,12 @@ def _icon_refresh_loop(icon: pystray.Icon, stop_event: threading.Event) -> None:
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     store.init_db()
 
     root = tk.Tk()

@@ -187,7 +187,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_console() -> None:
+    """Windows' default console codepage (e.g. cp1252) can't represent every
+    character this CLI prints (em-dashes, etc.) -- reconfigure stdout/stderr to
+    UTF-8 so output never risks a UnicodeEncodeError while trying to report a
+    result or error. No-op (and harmless) on streams that don't support it, e.g.
+    if output is redirected somewhere unusual."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main() -> int:
+    _force_utf8_console()
     parser = build_parser()
     args = parser.parse_args()
     try:

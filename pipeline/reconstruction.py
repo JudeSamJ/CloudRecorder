@@ -184,6 +184,14 @@ class SessionReconstructor:
             props = entry.get("appProperties") or {}
             name = entry.get("name", "<unknown>")
             file_id = entry["id"]
+
+            # Phase 6's session-completion marker (and any future master/proxy
+            # lookup by sessionId) shares the same sessionId tag but is explicitly
+            # kind-tagged and never a chunk -- skip it rather than treating its
+            # absent chunkIndex as corruption.
+            if props.get("kind") in ("session_complete", "master", "proxy"):
+                continue
+
             try:
                 chunk_index = int(props["chunkIndex"])
             except (KeyError, ValueError) as exc:
@@ -204,6 +212,12 @@ class SessionReconstructor:
                     size_bytes=int(entry.get("size", 0) or 0),
                     parent_id=parents[0],
                 )
+            )
+
+        if not chunks:
+            raise SessionNotFoundError(
+                f"Session '{session_id}' has a completion marker but no chunk files in Drive "
+                "(already reconstructed and cleaned up?)."
             )
 
         parent_ids = {chunk.parent_id for chunk in chunks}
