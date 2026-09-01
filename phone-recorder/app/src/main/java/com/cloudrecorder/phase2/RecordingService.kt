@@ -26,6 +26,7 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
+import com.cloudrecorder.phase2.upload.UploadRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -56,16 +57,18 @@ class RecordingService : LifecycleService() {
         const val ACTION_STOP = "com.cloudrecorder.phase2.action.STOP"
         const val EXTRA_QUALITY_NAME = "quality_name"
         const val EXTRA_CHUNK_INTERVAL_SECONDS = "chunk_interval_seconds"
+        const val EXTRA_PROJECT_NAME = "project_name"
 
         private const val CHANNEL_ID = "recording_channel"
         private const val NOTIFICATION_ID = 1001
         private const val GAP_WARN_THRESHOLD_MS = 300L
 
-        fun startIntent(context: Context, quality: Quality, chunkIntervalSeconds: Int): Intent =
+        fun startIntent(context: Context, quality: Quality, chunkIntervalSeconds: Int, projectName: String): Intent =
             Intent(context, RecordingService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_QUALITY_NAME, QualityUtils.name(quality))
                 putExtra(EXTRA_CHUNK_INTERVAL_SECONDS, chunkIntervalSeconds)
+                putExtra(EXTRA_PROJECT_NAME, projectName)
             }
 
         fun stopIntent(context: Context): Intent =
@@ -79,12 +82,18 @@ class RecordingService : LifecycleService() {
     private var tickerJob: Job? = null
 
     private lateinit var sessionDir: File
+    private lateinit var sessionId: String
+    private lateinit var projectName: String
     private var sessionStartMs = 0L
     private var chunkIndex = 0
     private var totalBytesAccum = 0L
     private var lastStopTimestamp = 0L
     private var isFullyStopping = false
     private var stopReason = "unknown"
+    private var currentChunkFile: File? = null
+    private var currentChunkRecordedAtMs = 0L
+
+    private val uploadRepository by lazy { UploadRepository.getInstance(applicationContext) }
 
     override fun onCreate() {
         super.onCreate()
@@ -105,10 +114,13 @@ class RecordingService : LifecycleService() {
 
         val quality = QualityUtils.fromName(intent.getStringExtra(EXTRA_QUALITY_NAME))
         val intervalSeconds = intent.getIntExtra(EXTRA_CHUNK_INTERVAL_SECONDS, 8)
+        projectName = intent.getStringExtra(EXTRA_PROJECT_NAME)?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: "Untitled"
         RecordingState.chunkIntervalSeconds.value = intervalSeconds
 
         sessionStartMs = System.currentTimeMillis()
         sessionDir = createSessionDir()
+        sessionId = sessionDir.name
         chunkIndex = 0
         totalBytesAccum = 0L
         lastStopTimestamp = 0L
@@ -250,6 +262,8 @@ class RecordingService : LifecycleService() {
         val capture = videoCapture ?: return
         chunkIndex += 1
         val file = File(sessionDir, "chunk_%04d.mp4".format(chunkIndex))
+        currentChunkFile = file
+        currentChunkRecordedAtMs = System.currentTimeMillis()
         val outputOptions = FileOutputOptions.Builder(file).build()
 
         var pending = capture.output.prepareRecording(this, outputOptions)
@@ -314,6 +328,14 @@ class RecordingService : LifecycleService() {
                         "Chunk $chunkIndex finalized: ${StorageMonitor.humanReadable(stats.numBytesRecorded)}, " +
                             "${stats.recordedDurationNanos / 1_000_000}ms",
                     )
+                }
+
+                // Even an error'd finalize (e.g. ERROR_SOURCE_INACTIVE) can leave a
+                // playable, non-empty file up to the point of failure — enqueue it
+                // rather than silently discarding footage that was actually captured.
+                val finishedFile = currentChunkFile
+                if (finishedFile != null && finishedFile.exists() && finishedFile.length() > 0) {
+                    uploadRepository.enqueueChunkAsync(sessionId, chunkIndex, finishedFile, projectName, currentChunkRecordedAtMs)
                 }
 
                 if (isFullyStopping) {

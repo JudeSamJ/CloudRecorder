@@ -14,7 +14,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.cloudrecorder.phase2.ui.RecorderScreen
+import com.cloudrecorder.phase2.upload.DriveAuthManager
+import com.cloudrecorder.phase2.upload.NetworkMonitor
+import com.cloudrecorder.phase2.upload.UploadRepository
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.common.api.ApiException
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -31,6 +38,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val signInLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        try {
+            GoogleSignIn.getSignedInAccountFromIntent(result.data).getResult(ApiException::class.java)
+            refreshSignInState()
+        } catch (e: ApiException) {
+            EventLogger.log(LogLevel.ERROR, "Google sign-in failed: ${e.message}")
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -39,10 +57,24 @@ class MainActivity : ComponentActivity() {
             probeSupportedQualities()
         }
 
+        RecordingState.projectName.value = ProjectPrefs.load(this)
+        refreshSignInState()
+
+        val uploadRepository = UploadRepository.getInstance(this)
+        lifecycleScope.launch { uploadRepository.recoverPendingUploads() }
+        lifecycleScope.launch {
+            uploadRepository.observeStats().collect { RecordingState.uploadStats.value = it }
+        }
+        lifecycleScope.launch {
+            NetworkMonitor.isOnline(this@MainActivity).collect { RecordingState.isOnline.value = it }
+        }
+
         setContent {
             RecorderScreen(
                 hasPermissions = permissionsGranted,
                 onRequestPermissions = { permissionLauncher.launch(requiredPermissions()) },
+                onSignIn = { signInLauncher.launch(DriveAuthManager.signInClient(this).signInIntent) },
+                onProjectNameChanged = { ProjectPrefs.save(this, it) },
             )
         }
     }
@@ -54,6 +86,11 @@ class MainActivity : ComponentActivity() {
             permissionsGranted = true
             probeSupportedQualities()
         }
+        refreshSignInState()
+    }
+
+    private fun refreshSignInState() {
+        RecordingState.signedInEmail.value = DriveAuthManager.currentEmail(this)
     }
 
     private fun requiredPermissions(): Array<String> {

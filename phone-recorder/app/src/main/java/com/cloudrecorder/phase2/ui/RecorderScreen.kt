@@ -18,9 +18,11 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -43,10 +45,17 @@ import com.cloudrecorder.phase2.QualityUtils
 import com.cloudrecorder.phase2.RecordingService
 import com.cloudrecorder.phase2.RecordingState
 import com.cloudrecorder.phase2.StorageMonitor
+import com.cloudrecorder.phase2.upload.UploadRepository
+import com.cloudrecorder.phase2.upload.UploadStats
 import java.io.File
 
 @Composable
-fun RecorderScreen(hasPermissions: Boolean, onRequestPermissions: () -> Unit) {
+fun RecorderScreen(
+    hasPermissions: Boolean,
+    onRequestPermissions: () -> Unit,
+    onSignIn: () -> Unit,
+    onProjectNameChanged: (String) -> Unit,
+) {
     val context = LocalContext.current
 
     LaunchedEffect(Unit) {
@@ -57,7 +66,7 @@ fun RecorderScreen(hasPermissions: Boolean, onRequestPermissions: () -> Unit) {
         if (!hasPermissions) {
             PermissionRequiredContent(onRequestPermissions)
         } else {
-            RecordingContent(context)
+            RecordingContent(context, onSignIn, onProjectNameChanged)
         }
     }
 }
@@ -79,7 +88,11 @@ private fun PermissionRequiredContent(onRequestPermissions: () -> Unit) {
 }
 
 @Composable
-private fun RecordingContent(context: Context) {
+private fun RecordingContent(
+    context: Context,
+    onSignIn: () -> Unit,
+    onProjectNameChanged: (String) -> Unit,
+) {
     val isRecording by RecordingState.isRecording.collectAsState()
     val availableQualities by RecordingState.availableQualities.collectAsState()
     val selectedQuality by RecordingState.selectedQuality.collectAsState()
@@ -90,6 +103,10 @@ private fun RecordingContent(context: Context) {
     val freeBytes by RecordingState.freeBytes.collectAsState()
     val logEntries by RecordingState.logEntries.collectAsState()
     val summary by RecordingState.lastSessionSummary.collectAsState()
+    val projectName by RecordingState.projectName.collectAsState()
+    val signedInEmail by RecordingState.signedInEmail.collectAsState()
+    val isOnline by RecordingState.isOnline.collectAsState()
+    val uploadStats by RecordingState.uploadStats.collectAsState()
 
     var showClearConfirm by remember { mutableStateOf(false) }
 
@@ -97,10 +114,37 @@ private fun RecordingContent(context: Context) {
         Column(
             modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp),
         ) {
-            Text("CloudRecorder — Phase 2", style = MaterialTheme.typography.titleLarge)
+            Text("CloudRecorder — Phase 3", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(12.dp))
 
+            SignInRow(signedInEmail = signedInEmail, onSignIn = onSignIn)
+            Spacer(Modifier.height(8.dp))
+
+            if (!isOnline) {
+                InfoBanner(
+                    "Offline — chunks record and buffer locally as usual. They only " +
+                        "upload (and the local buffer only stays small) while you're " +
+                        "connected; uploads resume automatically once you're back online.",
+                )
+                Spacer(Modifier.height(8.dp))
+            } else if (signedInEmail == null) {
+                InfoBanner("Not signed in — recording still works, but chunks won't upload until you sign in above.")
+                Spacer(Modifier.height(8.dp))
+            }
+
             if (!isRecording) {
+                OutlinedTextField(
+                    value = projectName,
+                    onValueChange = {
+                        RecordingState.projectName.value = it
+                        onProjectNameChanged(it)
+                    },
+                    label = { Text("Project name (matches Phase 1 Drive project)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+
                 QualityPicker(
                     available = QualityUtils.sortedHighestFirst(availableQualities),
                     selected = selectedQuality,
@@ -122,6 +166,9 @@ private fun RecordingContent(context: Context) {
                 freeBytes = freeBytes,
             )
 
+            Spacer(Modifier.height(8.dp))
+            UploadStatsCard(uploadStats)
+
             Spacer(Modifier.height(12.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -130,10 +177,10 @@ private fun RecordingContent(context: Context) {
                         onClick = {
                             val quality = selectedQuality ?: Quality.HD
                             context.startForegroundService(
-                                RecordingService.startIntent(context, quality, chunkInterval),
+                                RecordingService.startIntent(context, quality, chunkInterval, projectName),
                             )
                         },
-                        enabled = selectedQuality != null,
+                        enabled = selectedQuality != null && projectName.isNotBlank(),
                     ) { Text("Start Recording") }
                 } else {
                     Button(onClick = {
@@ -183,11 +230,60 @@ private fun RecordingContent(context: Context) {
 private fun clearAllChunks(context: Context) {
     val root = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "sessions")
     root.deleteRecursively()
+    UploadRepository.getInstance(context).clearAll()
     RecordingState.chunkCount.value = 0
     RecordingState.totalBytes.value = 0L
     RecordingState.lastSessionSummary.value = null
     RecordingState.logEntries.value = emptyList()
-    EventLogger.log(LogLevel.INFO, "Cleared all recorded chunks from device storage")
+    EventLogger.log(LogLevel.INFO, "Cleared all recorded chunks and upload queue from device storage")
+}
+
+@Composable
+private fun SignInRow(signedInEmail: String?, onSignIn: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (signedInEmail != null) {
+            Text("Signed in as $signedInEmail", style = MaterialTheme.typography.bodySmall)
+        } else {
+            OutlinedButton(onClick = onSignIn) { Text("Sign in with Google") }
+        }
+    }
+}
+
+@Composable
+private fun InfoBanner(text: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(12.dp),
+        )
+    }
+}
+
+@Composable
+private fun UploadStatsCard(stats: UploadStats) {
+    val context = LocalContext.current
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Upload status", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(4.dp))
+            Text("Recorded: ${stats.recorded}   Uploaded: ${stats.uploaded}")
+            Text("Uploading: ${stats.uploading}   Pending: ${stats.pending}   Failed: ${stats.failed}")
+            Text("Local buffer (not yet uploaded): ${StorageMonitor.humanReadable(stats.localBufferBytes)}")
+            if (stats.failed > 0) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = { UploadRepository.getInstance(context).retryAllFailed() }) {
+                    Text("Retry ${stats.failed} failed chunk(s)")
+                }
+            }
+        }
+    }
 }
 
 @Composable

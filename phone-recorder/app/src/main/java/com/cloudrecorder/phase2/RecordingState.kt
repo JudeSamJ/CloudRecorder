@@ -1,6 +1,7 @@
 package com.cloudrecorder.phase2
 
 import androidx.camera.video.Quality
+import com.cloudrecorder.phase2.upload.UploadStats
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
@@ -15,6 +16,9 @@ object RecordingState {
     val availableQualities = MutableStateFlow<List<Quality>>(emptyList())
     val selectedQuality = MutableStateFlow<Quality?>(null)
     val chunkIntervalSeconds = MutableStateFlow(8)
+    val projectName = MutableStateFlow("")
+    val signedInEmail = MutableStateFlow<String?>(null)
+    val isOnline = MutableStateFlow(true)
 
     val elapsedMs = MutableStateFlow(0L)
     val currentChunkElapsedMs = MutableStateFlow(0L)
@@ -23,6 +27,7 @@ object RecordingState {
     val freeBytes = MutableStateFlow(0L)
 
     val logEntries = MutableStateFlow<List<LogEntry>>(emptyList())
+    val uploadStats = MutableStateFlow(UploadStats())
 
     val lastSessionSummary = MutableStateFlow<SessionSummary?>(null)
 

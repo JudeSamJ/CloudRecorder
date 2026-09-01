@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.google.devtools.ksp")
 }
 
 android {
@@ -13,8 +14,8 @@ android {
         // reliability is only relevant on modern Android anyway.
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0-phase2"
+        versionCode = 2
+        versionName = "0.2.0-phase3"
     }
 
     buildTypes {
@@ -57,4 +58,21 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-video:$cameraxVersion")
+
+    // Phase 3: chunked/resumable upload to Google Drive
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Google Sign-In (drive.file scope) + background access-token retrieval via
+    // AccountManager. Deliberately not pulling in google-api-client/Drive client
+    // library: the resumable-upload REST protocol is implemented directly (OkHttp)
+    // so we have explicit control over session-URI persistence/resume across
+    // process restarts, which is the whole point of this phase.
+    implementation("com.google.android.gms:play-services-auth:21.2.0")
 }
