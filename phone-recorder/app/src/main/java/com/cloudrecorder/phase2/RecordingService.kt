@@ -14,6 +14,9 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import android.hardware.camera2.CaptureRequest
+import android.util.Range
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -63,6 +66,7 @@ class RecordingService : LifecycleService() {
         private const val CHANNEL_ID = "recording_channel"
         private const val NOTIFICATION_ID = 1001
         private const val GAP_WARN_THRESHOLD_MS = 300L
+        private const val TARGET_FPS = 30
 
         fun startIntent(context: Context, quality: Quality, chunkIntervalSeconds: Int, projectName: String): Intent =
             Intent(context, RecordingService::class.java).apply {
@@ -243,17 +247,31 @@ class RecordingService : LifecycleService() {
                     FallbackStrategy.higherQualityOrLowerThan(effectiveQuality),
                 )
                 val recorder = Recorder.Builder().setQualitySelector(qualitySelector).build()
-                val capture = VideoCapture.withOutput(recorder)
+                // CameraX's high-level Recorder/QualitySelector API only picks resolution,
+                // not frame rate -- on a device that supports e.g. 4K/60, it can otherwise
+                // pick 60fps for UHD. Pinning a fixed target FPS range via Camera2Interop is
+                // the standard way to control this explicitly; applied to both the
+                // recording and preview use cases since they share one capture session.
+                val captureBuilder = VideoCapture.Builder(recorder)
+                Camera2Interop.Extender(captureBuilder).setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS),
+                )
+                val capture = captureBuilder.build()
                 videoCapture = capture
 
                 // Bound in the same bindToLifecycle call as the recording use case, on
                 // the same camera session — this does not affect VideoCapture whether
                 // or not anything is actually attached to it as a frame consumer.
-                val previewUseCase = Preview.Builder().build()
+                val previewBuilder = Preview.Builder()
+                Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS),
+                )
+                val previewUseCase = previewBuilder.build()
 
                 provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, capture, previewUseCase)
+                val camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, capture, previewUseCase)
                 CameraPreviewBridge.preview.value = previewUseCase
+                CameraPreviewBridge.camera.value = camera
 
                 EventLogger.log(
                     LogLevel.INFO,
@@ -433,6 +451,8 @@ class RecordingService : LifecycleService() {
         tickerJob?.cancel()
         cameraProvider?.unbindAll()
         CameraPreviewBridge.preview.value = null
+        CameraPreviewBridge.camera.value = null
+        CameraPreviewBridge.torchOn.value = false
         releaseWakeLock()
 
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -479,6 +499,8 @@ class RecordingService : LifecycleService() {
         RecordingState.isServiceRunning.value = false
         tickerJob?.cancel()
         CameraPreviewBridge.preview.value = null
+        CameraPreviewBridge.camera.value = null
+        CameraPreviewBridge.torchOn.value = false
         releaseWakeLock()
         super.onDestroy()
     }

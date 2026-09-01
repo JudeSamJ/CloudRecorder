@@ -3,7 +3,9 @@ package com.cloudrecorder.phase2.ui
 import android.content.Context
 import android.os.Environment
 import android.widget.Toast
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -12,11 +14,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -76,7 +81,12 @@ fun RecorderScreen(
         if (!hasPermissions) {
             PermissionRequiredContent(onRequestPermissions)
         } else {
-            RecordingContent(context, onSignIn, onProjectNameChanged)
+            val isRecording by RecordingState.isRecording.collectAsState()
+            if (isRecording) {
+                FullScreenRecordingView()
+            } else {
+                SetupContent(context, onSignIn, onProjectNameChanged)
+            }
         }
     }
 }
@@ -97,17 +107,88 @@ private fun PermissionRequiredContent(onRequestPermissions: () -> Unit) {
     }
 }
 
+/**
+ * Full-screen live camera feed while recording, like a normal camera app — no
+ * setup form, no log clutter, just the preview with minimal overlaid controls.
+ * Everything else (event log, upload status, session stats) is still updating in
+ * RecordingState in the background and is visible again once you stop, on
+ * SetupContent's summary card.
+ */
 @Composable
-private fun RecordingContent(
+private fun FullScreenRecordingView() {
+    val elapsedMs by RecordingState.elapsedMs.collectAsState()
+    val chunkCount by RecordingState.chunkCount.collectAsState()
+    val freeBytes by RecordingState.freeBytes.collectAsState()
+    val camera by CameraPreviewBridge.camera.collectAsState()
+    val torchOn by CameraPreviewBridge.torchOn.collectAsState()
+    val context = LocalContext.current
+
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        CameraPreview(modifier = Modifier.fillMaxSize())
+
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .background(Color.Black.copy(alpha = 0.45f))
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            val elapsedSec = elapsedMs / 1000
+            Text(
+                "%d:%02d".format(elapsedSec / 60, elapsedSec % 60),
+                color = Color.White,
+                style = MaterialTheme.typography.titleLarge,
+            )
+            Text(
+                "$chunkCount chunks · ${StorageMonitor.humanReadable(freeBytes)} free",
+                color = Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .background(Color.Black.copy(alpha = 0.45f))
+                .padding(horizontal = 24.dp, vertical = 20.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
+            OutlinedButton(
+                onClick = {
+                    val cam = camera ?: return@OutlinedButton
+                    val target = !torchOn
+                    cam.cameraControl.enableTorch(target)
+                    CameraPreviewBridge.torchOn.value = target
+                },
+                enabled = hasFlash,
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = if (torchOn) Color(0xFFFFC107) else Color.Transparent,
+                    contentColor = if (torchOn) Color.Black else Color.White,
+                ),
+            ) { Text(if (torchOn) "⚡ Flash On" else "⚡ Flash") }
+
+            Button(
+                onClick = { context.startForegroundService(RecordingService.stopIntent(context)) },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD64545)),
+                shape = CircleShape,
+                modifier = Modifier.size(72.dp),
+            ) { Text("Stop", color = Color.White, style = MaterialTheme.typography.labelMedium) }
+        }
+    }
+}
+
+@Composable
+private fun SetupContent(
     context: Context,
     onSignIn: () -> Unit,
     onProjectNameChanged: (String) -> Unit,
 ) {
-    val isRecording by RecordingState.isRecording.collectAsState()
     val availableQualities by RecordingState.availableQualities.collectAsState()
     val selectedQuality by RecordingState.selectedQuality.collectAsState()
     val chunkInterval by RecordingState.chunkIntervalSeconds.collectAsState()
-    val elapsedMs by RecordingState.elapsedMs.collectAsState()
     val chunkCount by RecordingState.chunkCount.collectAsState()
     val totalBytes by RecordingState.totalBytes.collectAsState()
     val freeBytes by RecordingState.freeBytes.collectAsState()
@@ -144,58 +225,56 @@ private fun RecordingContent(
                 Spacer(Modifier.height(8.dp))
             }
 
-            if (!isRecording) {
-                OutlinedTextField(
-                    value = projectName,
-                    onValueChange = {
-                        RecordingState.projectName.value = it
-                        onProjectNameChanged(it)
-                    },
-                    label = { Text("Project name (matches Phase 1 Drive project)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = {
-                        isCreatingProject = true
-                        coroutineScope.launch {
-                            createNewProject(context, projectName) { isCreatingProject = false }
-                        }
-                    },
-                    enabled = !isCreatingProject && projectName.isNotBlank(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    if (isCreatingProject) {
-                        CircularProgressIndicator(modifier = Modifier.height(16.dp), strokeWidth = 2.dp)
-                        Text("  Creating...")
-                    } else {
-                        Text("Create New Project in Drive")
+            OutlinedTextField(
+                value = projectName,
+                onValueChange = {
+                    RecordingState.projectName.value = it
+                    onProjectNameChanged(it)
+                },
+                label = { Text("Project name (matches Phase 1 Drive project)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = {
+                    isCreatingProject = true
+                    coroutineScope.launch {
+                        createNewProject(context, projectName) { isCreatingProject = false }
                     }
+                },
+                enabled = !isCreatingProject && projectName.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (isCreatingProject) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.size(8.dp))
+                    Text("Creating...")
+                } else {
+                    Text("Create New Project in Drive")
                 }
-                Spacer(Modifier.height(12.dp))
-
-                QualityPicker(
-                    available = QualityUtils.sortedHighestFirst(availableQualities),
-                    selected = selectedQuality,
-                    onSelect = { RecordingState.selectedQuality.value = it },
-                )
-                Spacer(Modifier.height(8.dp))
-                ChunkIntervalPicker(
-                    selected = chunkInterval,
-                    onSelect = { RecordingState.chunkIntervalSeconds.value = it },
-                )
-                Spacer(Modifier.height(16.dp))
             }
+            Spacer(Modifier.height(12.dp))
 
-            if (isRecording) {
-                CameraPreview(modifier = Modifier.fillMaxWidth().height(280.dp))
-                Spacer(Modifier.height(12.dp))
-            }
+            QualityPicker(
+                available = QualityUtils.sortedHighestFirst(availableQualities),
+                selected = selectedQuality,
+                onSelect = { RecordingState.selectedQuality.value = it },
+            )
+            Spacer(Modifier.height(8.dp))
+            ChunkIntervalPicker(
+                selected = chunkInterval,
+                onSelect = { RecordingState.chunkIntervalSeconds.value = it },
+            )
+            Spacer(Modifier.height(16.dp))
 
             StatsCard(
-                isRecording = isRecording,
-                elapsedMs = elapsedMs,
+                isRecording = false,
+                elapsedMs = 0L,
                 chunkCount = chunkCount,
                 totalBytes = totalBytes,
                 freeBytes = freeBytes,
@@ -207,26 +286,17 @@ private fun RecordingContent(
             Spacer(Modifier.height(12.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (!isRecording) {
-                    Button(
-                        onClick = {
-                            val quality = selectedQuality ?: Quality.HD
-                            context.startForegroundService(
-                                RecordingService.startIntent(context, quality, chunkInterval, projectName),
-                            )
-                        },
-                        enabled = selectedQuality != null && projectName.isNotBlank(),
-                    ) { Text("Start Recording") }
-                } else {
-                    Button(onClick = {
-                        context.startForegroundService(RecordingService.stopIntent(context))
-                    }) { Text("Stop Recording") }
-                }
+                Button(
+                    onClick = {
+                        val quality = selectedQuality ?: Quality.HD
+                        context.startForegroundService(
+                            RecordingService.startIntent(context, quality, chunkInterval, projectName),
+                        )
+                    },
+                    enabled = selectedQuality != null && projectName.isNotBlank(),
+                ) { Text("Start Recording") }
 
-                OutlinedButton(
-                    onClick = { showClearConfirm = true },
-                    enabled = !isRecording,
-                ) { Text("Clear All Chunks") }
+                OutlinedButton(onClick = { showClearConfirm = true }) { Text("Clear All Chunks") }
             }
 
             summary?.let {
