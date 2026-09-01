@@ -86,8 +86,10 @@ def wait_for_local_sync(expected_path: Path, expected_size: int, timeout_seconds
     mean anything failed, just that Drive for desktop hasn't caught up yet;
     the file is already safely uploaded regardless."""
     deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
+    while True:
         if expected_path.is_file() and expected_path.stat().st_size == expected_size:
             return True
-        time.sleep(3)
-    return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(3, remaining))

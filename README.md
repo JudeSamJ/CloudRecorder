@@ -123,6 +123,31 @@ The CLI catches and reports, without a raw stack trace:
 - Drive API rate limit / quota errors (retries with exponential backoff
   first, then reports clearly if it still fails)
 
+## Running the automated test suite
+
+```
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+**What this covers, honestly:** every pure-logic piece that doesn't need a live
+Google account, real ffmpeg, or a real DaVinci Resolve install — the local
+SQLite session-state machine (`state_store`), the orchestrator's
+discover/reconstruct/chain-to-proxy/failure/pause logic (with fake Drive/
+reconstructor/proxy-generator objects standing in for the real ones), chunk
+completeness/gap/duplicate detection (the safety-critical check that decides
+whether reconstruction is even allowed to proceed), the project folder-tree
+logic, all the CLI's `argparse` wiring, and the companion app's state-
+aggregation/icon-color logic (with `tkinter`/`pystray` stubbed out, since this
+is a Windows tray app being tested outside Windows).
+
+**What this does NOT cover** — these need a real environment this test suite
+can't fake: actually calling the Google Drive API, actually running `ffmpeg`
+(chunk concatenation, DNxHR proxy encoding), actually connecting to DaVinci
+Resolve's scripting API, and the entire Android app (no Android SDK/emulator
+in a plain Python test run — that needs Android Studio, covered by the
+Android-side test protocols in each phase's own section below).
+
 ## Files
 
 - `drive_manager.py` — CLI entry point
