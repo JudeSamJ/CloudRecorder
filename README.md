@@ -1,8 +1,9 @@
-# Cloud Content Pipeline — Desktop App (Phases 1 + 4)
+# Cloud Content Pipeline — Desktop App (Phases 1, 4 + 5)
 
 A local CLI that authenticates with your personal Google account, manages a
-project folder structure in your Google Drive, and (Phase 4) reassembles a
-recording session's uploaded chunks into one validated master video:
+project folder structure in your Google Drive, reassembles a recording
+session's uploaded chunks into one validated master video (Phase 4), and
+generates a DaVinci Resolve editing proxy from that master (Phase 5):
 
 ```
 Content Creation/
@@ -15,7 +16,7 @@ Content Creation/
   Archive/
 ```
 
-Proxy generation and Resolve integration are later phases and are not
+DaVinci Resolve project automation itself is a later phase and is not
 implemented here.
 
 ## 1. Install dependencies
@@ -129,7 +130,9 @@ The CLI catches and reports, without a raw stack trace:
 - `pipeline/drive_client.py` — Drive API v3 wrapper, retry/backoff, error translation
 - `pipeline/project_manager.py` — folder-tree logic
 - `pipeline/reconstruction.py` — Phase 4: session verification + master reconstruction
-- `pipeline/ffmpeg_tools.py` — Phase 4: ffmpeg/ffprobe subprocess wrappers
+- `pipeline/ffmpeg_tools.py` — Phase 4 & 5: ffmpeg/ffprobe subprocess wrappers
+- `pipeline/proxy_generation.py` — Phase 5: DNxHR proxy generation
+- `pipeline/drive_desktop.py` — Phase 5: local Drive-sync path discovery
 - `pipeline/errors.py` — custom exceptions
 - `credentials.json`, `token.json` — local secrets, gitignored, not included in this repo
 
@@ -297,3 +300,157 @@ chunks yourself:
 If frame counts match and the boundary spot-check sounds continuous, you can
 trust the automated validation for future sessions without repeating this
 manual check every time.
+
+---
+
+# Phase 5: automatic proxy generation
+
+Once a session has a reconstructed master (Phase 4), `generate-proxy` builds
+a DaVinci Resolve editing proxy from it, validates it the same way Phase 4
+validates the master, and uploads it to the project's `Proxy/` folder.
+
+```
+python drive_manager.py generate-proxy <session-id>
+python drive_manager.py generate-proxy --watch [--interval SECONDS]
+```
+
+`--watch` polls Drive (default every 60s) for any reconstructed master that
+doesn't have a proxy yet and generates one automatically — opt-in, not the
+only way to trigger this; you can always run it for one session manually
+instead, e.g. if you've reconstructed several sessions but only want to
+proxy the one you're about to edit.
+
+## Design decisions
+
+**Codec/resolution: DNxHR LB, half-resolution, PCM audio, .mov container.**
+DNxHR is still the right call for a Resolve+Windows editing proxy — it's
+Avid's openly-specified, cross-platform, intra-frame-only codec built for
+exactly this (unlike H.264/HEVC, which are inter-frame delivery codecs that
+scrub badly in an editor no matter how fast they encode). The **LB**
+("Low Bandwidth") profile is specifically meant for half/quarter-res proxy
+work, which is why it's the default rather than SQ. Half-resolution
+(rounded down to even dimensions, since codecs generally require that) with
+PCM audio in a `.mov` container matches the standard convention for
+ffmpeg-generated Resolve proxies.
+
+**Hardware acceleration is real but partial — flagged honestly, not faked.**
+NVENC and Quick Sync only expose hardware *encoders* for H.264/HEVC/AV1;
+there's no hardware DNxHR encoder in ffmpeg. So hardware acceleration here
+means hardware-accelerated *decoding* of the source master (`-hwaccel
+cuda`/`qsv`) while the DNxHR encode itself always runs in software — that's
+genuinely faster than fully-software decode+encode when a GPU is available
+(decode is often the more expensive part for a 4K H.264/HEVC master), but
+it's not the full hardware speedup "NVENC" might suggest. ffmpeg is queried
+once for which hwaccel it was built with support for; if the actual encode
+attempt with that flag fails (e.g. no matching GPU present despite ffmpeg
+supporting the flag), it's retried once with plain software decode rather
+than failing the job — verified in testing by forcing a bogus hwaccel value
+and confirming the fallback still produces a valid proxy.
+
+**Filename convention for Resolve's auto-relink: identical filename stem,
+extension only differs.** A proxy named `<sessionId>_master.mp4` becomes
+`<sessionId>_master.mov` — same stem, so Resolve's own matching (which
+compares by filename stem, ignoring extension) finds it automatically. This
+is what makes the "no manual relinking" goal achievable: point Resolve's
+**Project Settings → Master Project Settings → General Options → Proxy
+media path** at this project's local (Drive-synced) `Proxy/` folder once,
+and every same-stemmed file placed there is picked up without a per-clip
+"Link Proxy Media" pass.
+
+**Local Drive-for-desktop path: detected, never assumed.** The proxy is
+uploaded via the Drive API — Drive for desktop syncs it down independently
+of anything this app does, regardless of how it's configured. Local-path
+detection exists only to tell you where to point Resolve and to optionally
+confirm the sync landed:
+- **Streaming mode** (Drive's default): detected by finding which Windows
+  drive letter has the volume label "Google Drive" — the letter itself is
+  user-configurable, so this doesn't assume a fixed one like `G:`.
+- **Mirror mode** (synced to an ordinary folder): a few common default
+  locations are checked (`~/Google Drive/My Drive`, `~/My Drive`, etc.).
+- An environment variable, `CLOUDRECORDER_DRIVE_LOCAL_PATH`, overrides both
+  if auto-detection ever guesses wrong or you have a nonstandard setup.
+- If nothing is found, the CLI says so plainly and tells you to check Drive
+  for desktop's own settings — this never blocks or fails the run, since the
+  proxy is already safely uploaded by that point regardless.
+
+**Validated before upload, same standard as Phase 4:** duration-sum
+tolerance (2 seconds or 2%, whichever is larger) against the master, plus a
+full ffmpeg decode pass. A validation failure means no upload happens at
+all — you get a clear error instead of a proxy that looks done but isn't.
+
+**Idempotency guard**, consistent with Phase 4: if a proxy already exists
+for a session (tracked via Drive `appProperties`, not filename guessing),
+generation refuses rather than creating a duplicate — delete the existing
+proxy first to regenerate it.
+
+## Usage and output
+
+```
+$ python drive_manager.py generate-proxy 20260901_143022
+Looking up reconstructed master for session '20260901_143022'...
+Downloading master '20260901_143022_master.mp4'...
+Encoding proxy (DNxHR LB, half-resolution, PCM audio, .mov container) at 1920x1080, trying cuda-accelerated decode...
+  encoding: 34%, ETA 41s
+  encoding: 100%
+Validating proxy...
+Uploading proxy '20260901_143022_master.mov' to Drive...
+  upload progress: 100%
+Waiting for local sync at G:\My Drive\Content Creation\Projects\YouTube_003\Proxy\20260901_143022_master.mov...
+
+Proxy generation succeeded.
+  Proxy file: 20260901_143022_master.mov
+  Duration: 341.18s
+  Resolution: 1920x1080
+  Size: 210.4 MB
+  Hardware-accelerated decode: cuda
+  Local path: G:\My Drive\Content Creation\Projects\YouTube_003\Proxy\20260901_143022_master.mov (confirmed synced)
+```
+
+## Test protocol
+
+### 1. Generate a proxy and confirm Resolve auto-relinks it
+
+1. Run `reconstruct` for a real session (Phase 4), then
+   `generate-proxy <session-id>`.
+2. Confirm the CLI's final summary shows a confirmed local sync path. If it
+   doesn't, wait a minute for Drive for desktop to catch up and check that
+   path manually (or check Drive for desktop's tray icon settings for your
+   actual sync location if auto-detection failed).
+3. Open DaVinci Resolve. Create a new project (or open an existing one) and
+   import the master file from your local `Original/` folder into the Media
+   Pool as you normally would.
+4. Go to **Project Settings → Master Project Settings → General Options**
+   and set **Proxy media path** to the local `Proxy/` folder path from step 2
+   (the project-specific one, e.g. `...\Projects\YouTube_003\Proxy`).
+5. Right-click the master clip in the Media Pool (or select all clips) and
+   enable **Use Proxy Media** (or toggle proxy mode from the playback
+   toolbar's proxy quality menu). Resolve should automatically recognize and
+   link `<sessionId>_master.mov` in that folder to the original clip — no
+   "Link Proxy Media" dialog needed.
+6. Confirm: the clip's thumbnail/playback should now be visibly lower
+   resolution (the proxy), scrubbing should feel noticeably lighter than
+   scrubbing the original, and clicking a timestamp should show matching
+   content between proxy and original (no offset).
+
+### 2. If auto-relink doesn't happen
+
+- **Check the filename stem matches exactly.** Open the Proxy folder and the
+  Original folder side by side — `<sessionId>_master.mp4` and
+  `<sessionId>_master.mov` should differ *only* in extension. If Phase 4 or
+  5 was interrupted/retried and produced a differently-named file, that's a
+  convention mismatch, not a Resolve problem.
+- **Check the Proxy media path is set to the right folder** (Project
+  Settings, not a global preference) and that it's the *local* filesystem
+  path Drive for desktop syncs to, not a raw Drive URL.
+- **Check the file actually synced locally** — if Drive for desktop hasn't
+  finished syncing yet, the proxy file won't exist at that local path at
+  all; Resolve can't link to a file that isn't there yet regardless of
+  naming. Re-check after a few minutes, or manually verify file existence.
+- **If the filename and path both check out and it still doesn't link**,
+  try Resolve's manual **right-click clip → Link Proxy Media → select
+  folder** once, pointed at the same Proxy folder — if that manual path
+  works but auto-detection via the Proxy media path setting doesn't, that
+  points to a Resolve-version-specific quirk in the auto-matching behavior
+  rather than a problem with the generated file itself, worth flagging back
+  since it would mean the convention needs adjusting for your Resolve
+  version specifically.

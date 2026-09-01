@@ -8,9 +8,12 @@ Usage:
 
 import argparse
 import sys
+import time
 
+from pipeline.drive_client import DriveClient
 from pipeline.errors import MissingChunksError, PipelineError
 from pipeline.project_manager import ProjectManager
+from pipeline.proxy_generation import ProxyGenerator, find_sessions_needing_proxy
 from pipeline.reconstruction import SessionReconstructor
 
 
@@ -56,6 +59,50 @@ def cmd_reconstruct(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_proxy_result(result) -> None:
+    print("\nProxy generation succeeded.")
+    print(f"  Proxy file: {result.proxy_name}")
+    print(f"  Duration: {result.duration_seconds:.2f}s")
+    print(f"  Resolution: {result.width}x{result.height}")
+    print(f"  Size: {result.size_bytes / (1024 * 1024):.1f} MB")
+    print(f"  Hardware-accelerated decode: {result.hardware_decode_used or 'no (software)'}")
+    if result.local_synced_path:
+        status = "confirmed synced" if result.local_sync_confirmed else "not yet confirmed (still syncing)"
+        print(f"  Local path: {result.local_synced_path} ({status})")
+    else:
+        print("  Local path: could not be auto-detected — check Google Drive for desktop's settings "
+              "for your Drive folder location; the proxy is already safely uploaded regardless.")
+
+
+def cmd_generate_proxy(args: argparse.Namespace) -> int:
+    if not args.watch and not args.session_id:
+        print("Error: session_id is required unless --watch is given.", file=sys.stderr)
+        return 2
+
+    generator = ProxyGenerator(on_progress=lambda msg: print(msg))
+
+    if not args.watch:
+        result = generator.generate_for_session(args.session_id)
+        _print_proxy_result(result)
+        return 0
+
+    print(f"Watching for new masters every {args.interval}s (Ctrl+C to stop)...")
+    client = DriveClient()
+    while True:
+        try:
+            sessions = find_sessions_needing_proxy(client)
+            for session_id in sessions:
+                print(f"\nFound reconstructed master with no proxy: session '{session_id}'")
+                try:
+                    result = generator.generate_for_session(session_id)
+                    _print_proxy_result(result)
+                except PipelineError as exc:
+                    print(f"  Error generating proxy for '{session_id}': {exc}", file=sys.stderr)
+        except PipelineError as exc:
+            print(f"Error while checking for new masters: {exc}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="drive_manager.py",
@@ -79,6 +126,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconstruct_parser.add_argument("session_id", help="Session ID tagged on the phone-uploaded chunks")
     reconstruct_parser.set_defaults(func=cmd_reconstruct)
+
+    proxy_parser = subparsers.add_parser(
+        "generate-proxy", help="Generate a DNxHR editing proxy from a session's reconstructed master"
+    )
+    proxy_parser.add_argument(
+        "session_id", nargs="?", default=None,
+        help="Session ID of a reconstructed master (omit only when using --watch)",
+    )
+    proxy_parser.add_argument(
+        "--watch", action="store_true",
+        help="Continuously watch for newly-reconstructed masters and auto-generate proxies for them",
+    )
+    proxy_parser.add_argument(
+        "--interval", type=int, default=60,
+        help="Polling interval in seconds for --watch (default: 60)",
+    )
+    proxy_parser.set_defaults(func=cmd_generate_proxy)
 
     return parser
 

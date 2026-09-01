@@ -184,7 +184,7 @@ class DriveClient:
             done = False
             while not done:
                 try:
-                    _, done = downloader.next_chunk(num_retries=_DOWNLOAD_NUM_RETRIES)
+                    _, done = downloader.next_chunk(num_retries=_CHUNK_NUM_RETRIES)
                 except HttpError as exc:
                     status = exc.resp.status if exc.resp is not None else None
                     if status == 401:
@@ -201,16 +201,19 @@ class DriveClient:
         name: str,
         mime_type: str = "video/mp4",
         progress_callback=None,
+        app_properties: dict[str, str] | None = None,
     ) -> str:
         """Resumable upload of a local file to Drive. Returns the new file's id."""
         metadata = {"name": name, "parents": [parent_id]}
+        if app_properties:
+            metadata["appProperties"] = app_properties
         media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True, chunksize=8 * 1024 * 1024)
         request = self._service.files().create(body=metadata, media_body=media, fields="id")
 
         response = None
         while response is None:
             try:
-                status, response = request.next_chunk(num_retries=_DOWNLOAD_NUM_RETRIES)
+                status, response = request.next_chunk(num_retries=_CHUNK_NUM_RETRIES)
             except HttpError as exc:
                 http_status = exc.resp.status if exc.resp is not None else None
                 if http_status == 401:
@@ -222,6 +225,10 @@ class DriveClient:
             if status and progress_callback:
                 progress_callback(status.progress())
         return response["id"]
+
+    def get_file(self, file_id: str, fields: str = "id, name, parents") -> dict:
+        request = self._service.files().get(fileId=file_id, fields=fields)
+        return self._execute(request)
 
     def delete_file(self, file_id: str) -> None:
         request = self._service.files().delete(fileId=file_id)

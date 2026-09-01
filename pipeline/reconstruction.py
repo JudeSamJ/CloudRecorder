@@ -147,6 +147,7 @@ class SessionReconstructor:
             master_file_id = self._client.upload_file(
                 master_path, original_folder_id, master_name,
                 progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
+                app_properties={"sessionId": session_id, "kind": "master"},
             )
             report.append(f"Uploaded master as '{master_name}' (id={master_file_id})")
 

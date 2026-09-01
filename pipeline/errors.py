@@ -48,3 +48,19 @@ class ReconstructionValidationError(PipelineError):
 
 class FFmpegNotFoundError(PipelineError):
     """ffmpeg/ffprobe are not installed or not on PATH."""
+
+
+class FFmpegError(PipelineError):
+    """A low-level ffmpeg/ffprobe subprocess call failed."""
+
+
+class MasterNotFoundError(PipelineError):
+    """No reconstructed master file exists in Drive for the requested session."""
+
+
+class ProxyAlreadyExistsError(PipelineError):
+    """A proxy file for this session already exists in Drive."""
+
+
+class ProxyValidationError(PipelineError):
+    """The generated proxy failed duration or decode-integrity validation."""
