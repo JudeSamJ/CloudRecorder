@@ -33,7 +33,9 @@ from tkinter import messagebox, ttk
 import pystray
 from PIL import Image, ImageDraw
 
+from pipeline import resolve_bridge
 from pipeline import state_store as store
+from pipeline.errors import PipelineError
 from pipeline.orchestrator import Orchestrator
 
 POLL_INTERVAL_SECONDS = 30
@@ -152,6 +154,7 @@ class Dashboard:
         tk.Button(button_row, text="Retry failed", command=self._on_retry).pack(side="left", padx=2)
         tk.Button(button_row, text="Pause", command=lambda: self._set_paused(True)).pack(side="left", padx=2)
         tk.Button(button_row, text="Resume", command=lambda: self._set_paused(False)).pack(side="left", padx=2)
+        tk.Button(button_row, text="Open in Resolve", command=self._on_open_resolve).pack(side="left", padx=2)
         tk.Button(button_row, text="Refresh now", command=self._refresh).pack(side="left", padx=2)
 
         tk.Label(window, text="Recent activity", anchor="w").pack(fill="x", padx=8)
@@ -185,6 +188,41 @@ class Dashboard:
         store.retry_failed(session_id)
         threading.Thread(target=self._orchestrator.process_session_now, args=(session_id,), daemon=True).start()
         self._refresh()
+
+    def _on_open_resolve(self) -> None:
+        session_id = self._selected_session_id()
+        if not session_id:
+            messagebox.showinfo("Open in Resolve", "Select a session first.")
+            return
+        session = store.get_session(session_id)
+        if session is None:
+            messagebox.showerror("Open in Resolve", f"Session '{session_id}' not found.")
+            return
+        if session.stage != store.READY:
+            messagebox.showinfo(
+                "Open in Resolve",
+                f"Session '{session_id}' is at stage '{_STAGE_LABELS.get(session.stage, session.stage)}', "
+                "not Ready to edit yet.",
+            )
+            return
+
+        _log(session_id, "Opening in Resolve...")
+        threading.Thread(target=self._run_open_resolve, args=(session,), daemon=True).start()
+
+    def _run_open_resolve(self, session) -> None:
+        try:
+            checklist = resolve_bridge.open_in_resolve(session)
+        except PipelineError as exc:
+            _log(session.session_id, f"Open in Resolve failed: {exc}")
+            self._window.after(0, lambda: messagebox.showerror("Open in Resolve", str(exc)))
+            return
+
+        for step, ok, detail in checklist.steps:
+            _log(session.session_id, f"{'OK' if ok else 'MISSING'}: {step}{' — ' + detail if detail else ''}")
+
+        title = "Open in Resolve — done" if checklist.all_ok else "Open in Resolve — needs your attention"
+        show = messagebox.showinfo if checklist.all_ok else messagebox.showwarning
+        self._window.after(0, lambda: show(title, checklist.render()))
 
     def _set_paused(self, paused: bool) -> None:
         session_id = self._selected_session_id()

@@ -64,3 +64,21 @@ class ProxyAlreadyExistsError(PipelineError):
 
 class ProxyValidationError(PipelineError):
     """The generated proxy failed duration or decode-integrity validation."""
+
+
+class ResolveNotAvailableError(PipelineError):
+    """The DaVinci Resolve scripting module couldn't be imported — env vars
+    (RESOLVE_SCRIPT_API/LIB, PYTHONPATH) missing, or Resolve isn't installed."""
+
+
+class ResolveConnectionError(PipelineError):
+    """Could not connect to (or launch and then connect to) a running Resolve."""
+
+
+class SessionNotReadyError(PipelineError):
+    """The requested session isn't at the READY stage yet (no validated proxy)."""
+
+
+class LocalSyncNotFoundError(PipelineError):
+    """The session's original or proxy file isn't present yet at its expected
+    local Drive-for-desktop-synced path."""

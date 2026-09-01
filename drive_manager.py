@@ -10,8 +10,10 @@ import argparse
 import sys
 import time
 
+from pipeline import resolve_bridge
+from pipeline import state_store as store
 from pipeline.drive_client import DriveClient
-from pipeline.errors import MissingChunksError, PipelineError
+from pipeline.errors import MissingChunksError, PipelineError, SessionNotReadyError
 from pipeline.project_manager import ProjectManager
 from pipeline.proxy_generation import ProxyGenerator, find_sessions_needing_proxy
 from pipeline.reconstruction import SessionReconstructor
@@ -103,6 +105,33 @@ def cmd_generate_proxy(args: argparse.Namespace) -> int:
         time.sleep(args.interval)
 
 
+def cmd_open_resolve(args: argparse.Namespace) -> int:
+    store.init_db()
+    session = store.get_session(args.session_id)
+    if session is None:
+        raise SessionNotReadyError(
+            f"Session '{args.session_id}' isn't known to the companion app's local "
+            "state yet. Run the companion app (companion_app.py) and let it "
+            "discover this session first, or check the session ID."
+        )
+    if session.stage != store.READY:
+        raise SessionNotReadyError(
+            f"Session '{args.session_id}' is at stage '{session.stage}', not READY "
+            "yet — its proxy hasn't been validated and synced. Check the companion "
+            "app's dashboard for its current status."
+        )
+
+    print(f"Opening session '{args.session_id}' (project '{session.project_name}') in Resolve...\n")
+    checklist = resolve_bridge.open_in_resolve(session)
+    print(checklist.render())
+    return 0 if checklist.all_ok else 1
+
+
+def cmd_resolve_probe(args: argparse.Namespace) -> int:
+    print(resolve_bridge.probe())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="drive_manager.py",
@@ -143,6 +172,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Polling interval in seconds for --watch (default: 60)",
     )
     proxy_parser.set_defaults(func=cmd_generate_proxy)
+
+    open_resolve_parser = subparsers.add_parser(
+        "open-resolve", help="Open a READY session in DaVinci Resolve (create/open project, import, link proxy, timeline)"
+    )
+    open_resolve_parser.add_argument("session_id", help="Session ID marked READY by the companion app")
+    open_resolve_parser.set_defaults(func=cmd_open_resolve)
+
+    resolve_probe_parser = subparsers.add_parser(
+        "resolve-probe", help="Diagnose what your installed DaVinci Resolve's scripting API actually supports"
+    )
+    resolve_probe_parser.set_defaults(func=cmd_resolve_probe)
 
     return parser
 

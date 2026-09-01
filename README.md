@@ -629,3 +629,169 @@ you'd only discover later when a proxy you expected isn't there.
 
 No DaVinci Resolve project file automation (Phase 7) — this phase's job ends the
 moment a validated proxy is sitting synced and ready to edit.
+
+---
+
+# Phase 7: DaVinci Resolve integration
+
+Given a session the companion app has marked `READY` (Phase 6), `open-resolve`
+creates that session's DaVinci Resolve project, imports the original, explicitly
+links the proxy, best-effort sets "Prefer Proxies," and builds a starter timeline
+— reducing your setup clicks before you start editing normally, not replacing
+Resolve's own interface.
+
+```
+python drive_manager.py open-resolve <session-id>
+```
+
+Also available from the companion app's dashboard: select a `Ready to edit`
+session, click **Open in Resolve**.
+
+**Project structure (your choice, confirmed before building): one Resolve
+project per recording session**, not one shared project per series. Each
+session gets its own project named `<projectName> - <sessionId>`. Clicking
+**Open in Resolve** again for the same session reopens that same project
+(`CreateProject` returns `None` for a name that already exists, at which point
+the code falls back to `LoadProject`) rather than duplicating it.
+
+## Run this first: `resolve-probe`
+
+```
+python drive_manager.py resolve-probe
+```
+
+Read the honesty section at the top of `pipeline/resolve_bridge.py` for the
+full reasoning, but the short version: I could not test any of this against a
+real DaVinci Resolve install from where this was built (no Windows machine, no
+Resolve here). What's implemented is split into two tiers:
+
+**Built on confirmed API behavior** (per Blackmagic's published scripting
+docs, stable since Resolve 16/17, free version included — not Studio-gated):
+project creation/loading, Media Pool import, `MediaPoolItem.LinkProxyMedia()`
+for explicit proxy linking (checked via its actual boolean return, not
+assumed), and timeline creation.
+
+**Not independently verifiable without your machine**, handled defensively:
+whether "Prefer Proxies" is exposed via `SetSetting()` at all in your specific
+Resolve version — Blackmagic doesn't publish a full settings-key list, so
+`resolve-probe` empirically dumps `GetSetting("")` and searches for keys
+containing "proxy" rather than a script assuming a hardcoded key name is
+correct. **Run `resolve-probe` once and read its output** before trusting the
+"Prefer Proxies" checklist line — if it reports no usable proxy key was found,
+that's real information (not a bug to fix), and the one manual click documented
+below is what you'll do instead every time.
+
+## Required one-time manual setup (this code cannot do this for you)
+
+1. **Resolve → Preferences → General → "External scripting using"** must be
+   set to **Local** (often defaults to "None"). Without this, no external
+   Python process — including this one — can connect to Resolve's scripting
+   API at all, regardless of anything else being configured correctly.
+2. Set these three environment variables (System Properties → Environment
+   Variables, or your shell profile) before running any `drive_manager.py`
+   command that touches Resolve:
+   ```
+   RESOLVE_SCRIPT_API=%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting
+   RESOLVE_SCRIPT_LIB=C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll
+   PYTHONPATH=%PYTHONPATH%;%RESOLVE_SCRIPT_API%\Modules
+   ```
+   (Adjust paths if Resolve is installed somewhere non-default.) `resolve-probe`
+   fails with these exact instructions printed if this isn't set up yet, rather
+   than a bare import traceback.
+3. If Resolve is installed somewhere other than the default
+   `C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe`, set
+   `CLOUDRECORDER_RESOLVE_EXE` to your actual path so this code can launch it
+   when it isn't already running.
+
+## What "Open in Resolve" actually does, step by step
+
+1. Computes the expected local (Drive-for-desktop-synced) paths for the
+   session's original and proxy from the same `<sessionId>_master.mp4`/`.mov`
+   naming convention Phases 4/5 already use — no extra Drive API call needed.
+2. Waits briefly for both files to actually exist at those local paths (Drive
+   for desktop sync can lag behind the Drive-side upload) — reports clearly if
+   they're not there rather than failing on a missing-file error deeper in.
+3. Connects to a running Resolve, or launches `Resolve.exe` and polls for the
+   connection (up to 90s) if it wasn't already open.
+4. Creates (or reopens) the session's project.
+5. Imports the original into the Media Pool.
+6. Calls `LinkProxyMedia()` on the imported clip and checks its actual return
+   value — this is real proxy linking, verified, not "the file is present in
+   the Proxy folder so it's probably linked."
+7. Attempts to set "Prefer Proxies" (see the honesty section above); reports
+   whether it actually succeeded.
+8. Creates a new timeline and appends the imported clip(s) — footage ready to
+   cut, no auto-editing.
+
+Every one of these eight steps is independently recorded — a failure at step 3
+doesn't silently skip steps 4-8, it stops and reports exactly steps 1-2 as done
+and everything after as not attempted, so you always know precisely where
+automation stopped and manual work should pick up.
+
+## Test protocol
+
+1. Get one session to `Ready to edit` in the companion app (Phase 6's own test
+   protocol, or just let a real recording flow through normally).
+2. Run `python drive_manager.py resolve-probe` once. Read its output — note
+   whether it found a usable "proxy" settings key. This tells you which
+   outcome to expect for the "Prefer Proxies" line below.
+3. Run `python drive_manager.py open-resolve <session-id>` (or the dashboard
+   button). Watch the printed checklist.
+
+### Checklist: what should already be true when it finishes
+
+- [ ] **Original media synced locally** — checked (this is a local disk check,
+  should essentially always pass if the session reached `READY`).
+- [ ] **Proxy media synced locally** — checked, same reasoning.
+- [ ] **Connect to DaVinci Resolve** — checked once Resolve is up (launches it
+  automatically if it wasn't running; give it up to 90s the first time).
+- [ ] **Create or open Resolve project** — a new project named
+  `<projectName> - <sessionId>` exists in Resolve's Project Manager (or the
+  existing one reopened, on a repeat run).
+- [ ] **Import original media into Media Pool** — the master clip is visible
+  in the project's Media Pool.
+- [ ] **Link proxy media** — checked *only if* `LinkProxyMedia()` returned
+  `True`. **If this shows unchecked**, right-click the clip in Resolve's Media
+  Pool → **Link Proxy Media** → select the `.mov` file in the local `Proxy/`
+  folder, manually, once. This is exactly the "flag it clearly rather than
+  assume it worked" behavior the phase asked for.
+- [ ] **Set 'Prefer Proxies' for this project** — checked only if a working
+  settings key was actually found and verified by reading it back. **If
+  unchecked** (very possible — see the honesty section above): Resolve's
+  **Playback menu → Proxy Handling → Prefer Proxies**, one click, applies
+  Resolve-wide rather than per-project anyway.
+- [ ] **Create timeline with clip(s)** — a new timeline named
+  `<sessionId> - Timeline` exists with the clip already on it, ready to edit.
+
+### What you should still expect to do manually, always
+
+Actual editing, obviously — this phase deliberately builds no cutting/
+arranging intelligence. And per the checklist above: possibly one manual
+proxy-relink click, and near-certainly one manual "Prefer Proxies" toggle
+(Resolve-wide, one-time — not per session) unless `resolve-probe` found a
+working scriptable key on your version.
+
+## What's still missing for true end-to-end automation (Phase 8 territory)
+
+Phase 8 was described as "should mostly fall out of Phases 1-7 working
+together." Based on what actually got built, here's what I think is genuinely
+still missing rather than already covered:
+
+- **No trigger from "Open in Resolve" back to a fully unattended flow** — a
+  human still has to click it per session (by design, matching your
+  one-project-per-session choice and the "don't build editing tools" limit).
+  If true zero-touch end-to-end is the Phase 8 goal, that click is the one
+  remaining manual step in the entire pipeline, and it's worth deciding
+  explicitly in Phase 8 whether "Open in Resolve" should also auto-fire the
+  moment a session reaches `READY`, or whether opening your NLE automatically
+  without you asking is actually not something you'd want.
+- **The "Prefer Proxies" gap is a real open question**, not just a Phase 7
+  loose end — until `resolve-probe` is actually run against your Resolve
+  install, we don't know whether that setting can be automated at all on your
+  version. Phase 8 shouldn't assume either answer.
+- **Multi-session videos**: since this phase deliberately chose
+  one-project-per-session, a YouTube video built from several recording
+  sessions still needs you to manually combine those projects/timelines in
+  Resolve. If that's a real workflow you'll hit often, it's worth an explicit
+  decision (not a silent assumption) whether a future phase should support
+  merging sessions into one project instead.
