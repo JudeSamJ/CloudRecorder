@@ -23,3 +23,28 @@ class DuplicateProjectError(PipelineError):
 
 class ProjectNotFoundError(PipelineError):
     """A requested project does not exist under Content Creation/Projects."""
+
+
+class SessionNotFoundError(PipelineError):
+    """No chunks were found in Drive for the requested session ID."""
+
+
+class MissingChunksError(PipelineError):
+    """A session's chunks have gaps or duplicate sequence numbers."""
+
+    def __init__(self, message: str, missing: list[int], duplicates: list[int]):
+        super().__init__(message)
+        self.missing = missing
+        self.duplicates = duplicates
+
+
+class MasterAlreadyExistsError(PipelineError):
+    """A master file for this session already exists in Drive."""
+
+
+class ReconstructionValidationError(PipelineError):
+    """The reconstructed master failed duration or decode-integrity validation."""
+
+
+class FFmpegNotFoundError(PipelineError):
+    """ffmpeg/ffprobe are not installed or not on PATH."""

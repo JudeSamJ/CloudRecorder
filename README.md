@@ -1,7 +1,8 @@
-# Cloud Content Pipeline — Phase 1: Google Drive Foundation
+# Cloud Content Pipeline — Desktop App (Phases 1 + 4)
 
-A small local CLI that authenticates with your personal Google account and
-manages a project folder structure in your Google Drive:
+A local CLI that authenticates with your personal Google account, manages a
+project folder structure in your Google Drive, and (Phase 4) reassembles a
+recording session's uploaded chunks into one validated master video:
 
 ```
 Content Creation/
@@ -14,9 +15,8 @@ Content Creation/
   Archive/
 ```
 
-This phase only handles authentication and folder management. Phone
-recording, chunked upload, proxy generation, and Resolve integration are
-later phases and are not implemented here.
+Proxy generation and Resolve integration are later phases and are not
+implemented here.
 
 ## 1. Install dependencies
 
@@ -128,5 +128,172 @@ The CLI catches and reports, without a raw stack trace:
 - `pipeline/auth.py` — OAuth2 flow, token load/refresh
 - `pipeline/drive_client.py` — Drive API v3 wrapper, retry/backoff, error translation
 - `pipeline/project_manager.py` — folder-tree logic
+- `pipeline/reconstruction.py` — Phase 4: session verification + master reconstruction
+- `pipeline/ffmpeg_tools.py` — Phase 4: ffmpeg/ffprobe subprocess wrappers
 - `pipeline/errors.py` — custom exceptions
 - `credentials.json`, `token.json` — local secrets, gitignored, not included in this repo
+
+---
+
+# Phase 4: session verification + master video reconstruction
+
+Once a phone recording session's chunks are sitting in `Original/` (Phase 3),
+`reconstruct` verifies the sequence is complete, stitches the chunks into one
+master video, validates it, and only then uploads the master and deletes the
+source chunks from Drive.
+
+```
+python drive_manager.py reconstruct <session-id>
+```
+
+The session ID is the same one tagged on each chunk's Drive `appProperties`
+by the phone app (visible in the phone app's Event Log, or as the
+`chunk_XXXX.mp4` files' shared `<sessionId>_chunk_NNNN.mp4` prefix in Drive).
+You don't need to specify which project — chunks are found globally by their
+`sessionId` tag, and the project folder is inferred from where they live.
+
+## Requirements
+
+- **FFmpeg and ffprobe must be installed and on your PATH.** The CLI checks
+  for both up front and fails with an install pointer
+  (https://ffmpeg.org/download.html) if either is missing, before touching
+  Drive or local disk.
+
+## Design decisions
+
+**Concat method: the ffmpeg concat *demuxer* with stream copy**
+(`-f concat -safe 0 -i list.txt -c copy`), not the concat protocol or concat
+filter. All chunks in a session come from the same CameraX `Recorder` run
+with identical codec settings — the concat demuxer is built exactly for
+stitching same-codec segments at the container level, copying packets
+without decoding, which is lossless, fast, and can't introduce the
+audio/video desync that re-encoding (the concat *filter*) risks. The concat
+*protocol* isn't usable at all here — it only supports a handful of formats
+like MPEG-TS, not MP4.
+
+**Local temp disk usage: roughly 2× the final master's size, briefly.**
+Chunks are downloaded (~1× final size, since stream-copy concatenation
+doesn't change total bytes) and the assembled master is written alongside
+them (another ~1×) before upload. The temp directory is created with
+`tempfile.mkdtemp()` and removed in a `finally` block — cleaned up whether
+reconstruction succeeds, fails validation, or crashes partway through.
+
+**Order of operations is fixed and cannot be optimized away:** verify
+completeness → download → concat → validate (duration + decode integrity) →
+upload master → *only then* delete chunks. If validation fails, the process
+stops there — no upload, no deletion; the chunks remain in Drive as the
+source of truth and the failure is written to a Drive-side report so you
+know exactly what happened without needing to have watched the terminal.
+
+**Session lookup is global, not folder-scoped.** Chunks are found by
+querying Drive for `appProperties has { key='sessionId' and value='<id>' }`
+directly (the `drive.file` scope only shows files this app created anyway),
+so a session that's sat around unreconstructed for a while is found the same
+way regardless of which project it belongs to — you don't need to remember
+or re-specify the project name.
+
+**Both missing chunks and duplicate chunk-index values are treated as fatal**,
+reported by exact index (e.g. "missing chunk index(es) [5, 6]"), not just a
+generic "incomplete" message — this is checked before any download or ffmpeg
+work happens.
+
+**Idempotency guard:** if `<sessionId>_master.mp4` already exists in the
+project's `Original/` folder, reconstruction refuses outright rather than
+silently overwriting or duplicating it. Delete the existing master first if
+you intentionally want to redo reconstruction.
+
+**Reconstruction reports are uploaded to Drive**, saved as
+`<sessionId>_reconstruction_report_<timestamp>.txt` in the project's
+`Original/` folder — both for a successful run (chunks found, durations,
+validation results, upload/deletion confirmation) and for an aborted one
+(exactly which chunk indices were missing/duplicated). Each attempt gets its
+own timestamped report rather than overwriting a prior one, so a session you
+retried after fixing a gap keeps its failure history alongside the eventual
+success.
+
+## Usage and output
+
+```
+$ python drive_manager.py reconstruct 20260901_143022
+Looking up chunks for session '20260901_143022'...
+Downloading chunk 1/42: 20260901_143022_chunk_0001.mp4
+...
+Probing chunk durations...
+Concatenating 42 chunks with ffmpeg (stream copy)...
+Validating reconstructed master...
+Uploading master '20260901_143022_master.mp4' to Drive...
+  upload progress: 23%
+  ...
+Deleting 42 chunk files from Drive...
+Done.
+
+Reconstruction succeeded.
+  Master file: 20260901_143022_master.mp4
+  Duration: 341.20s
+  Size: 812.4 MB
+  Chunks reassembled: 42
+  Drive file id: 1AbCdEfGhIjKlMnOpQrStUvWxYz
+  Source chunks have been deleted from Drive.
+```
+
+On a missing-chunk failure:
+
+```
+$ python drive_manager.py reconstruct 20260901_143022
+Looking up chunks for session '20260901_143022'...
+Error: Session incomplete/corrupt: missing chunk index(es) [17]
+  Missing chunk index(es): [17]
+  Duplicate chunk index(es): []
+A reconstruction report with these details was uploaded to the project's Original/ folder.
+```
+
+## Test protocol
+
+### 1. Intentionally testing a missing chunk
+
+1. Record and let a short session (e.g. 6-8 chunks) fully upload via the
+   phone app.
+2. In Drive, manually delete one chunk file from the middle of the sequence
+   (e.g. chunk 4 of 8) — this simulates a lost/failed upload.
+3. Run `python drive_manager.py reconstruct <session-id>`.
+4. **Expected:** the command fails immediately after the chunk lookup step
+   (no download, no ffmpeg run), reports "missing chunk index(es) [4]"
+   precisely, exits non-zero, and a reconstruction report documenting the
+   gap appears in the project's `Original/` folder. Confirm no master file
+   was created and no remaining chunks were deleted — the folder should be
+   unchanged except for the new report.
+5. Re-upload/replace the missing chunk (or re-record), then re-run
+   `reconstruct` and confirm it now succeeds.
+
+### 2. Verifying a reconstructed master is frame-accurate, not just "a file exists"
+
+Duration-matching and the ffmpeg decode pass catch corruption and gross
+mismatches, but to independently confirm frame accuracy against the original
+chunks yourself:
+
+1. Before running `reconstruct`, download the session's chunks yourself
+   (or note their Drive file IDs) so you still have a copy to compare
+   against even after Phase 4 deletes them from Drive.
+2. After reconstruction, download the resulting master file.
+3. Compare frame counts: run
+   `ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 <file>`
+   on each original chunk and sum the results, then run the same command on
+   the master file. The totals should match exactly (stream-copy
+   concatenation doesn't add, drop, or duplicate frames).
+4. Spot-check sync at a chunk boundary: seek the master to a timestamp near
+   a boundary you know from the original chunk durations (e.g. the end of
+   chunk 3 into the start of chunk 4) and visually confirm audio and video
+   still line up — `ffplay -ss <seconds> <master file>` is enough for a
+   spot check, no need to watch the whole thing.
+5. Compare total duration precisely: `ffprobe -v error -show_entries
+   format=duration -of default=nokey=1:noprint_wrappers=1` on the master
+   should be within roughly a frame or two's worth of time of the sum of the
+   original chunks' durations — Phase 4's own validation checks this with a
+   deliberately loose tolerance (2 seconds or 2%, whichever is larger) to
+   avoid false-positive failures on trivial container-timestamp rounding;
+   your manual check can be tighter since you're doing it once, by hand,
+   specifically to build trust in the automated check.
+
+If frame counts match and the boundary spot-check sounds continuous, you can
+trust the automated validation for future sessions without repeating this
+manual check every time.

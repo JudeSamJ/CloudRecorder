@@ -9,8 +9,9 @@ Usage:
 import argparse
 import sys
 
-from pipeline.errors import PipelineError
+from pipeline.errors import MissingChunksError, PipelineError
 from pipeline.project_manager import ProjectManager
+from pipeline.reconstruction import SessionReconstructor
 
 
 def cmd_create_project(args: argparse.Namespace) -> int:
@@ -32,6 +33,29 @@ def cmd_list_projects(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconstruct(args: argparse.Namespace) -> int:
+    reconstructor = SessionReconstructor(on_progress=lambda msg: print(msg))
+    try:
+        result = reconstructor.reconstruct(args.session_id)
+    except MissingChunksError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        if exc.missing:
+            print(f"  Missing chunk index(es): {exc.missing}", file=sys.stderr)
+        if exc.duplicates:
+            print(f"  Duplicate chunk index(es): {exc.duplicates}", file=sys.stderr)
+        print("A reconstruction report with these details was uploaded to the project's Original/ folder.", file=sys.stderr)
+        return 1
+
+    print("\nReconstruction succeeded.")
+    print(f"  Master file: {result.master_name}")
+    print(f"  Duration: {result.duration_seconds:.2f}s")
+    print(f"  Size: {result.size_bytes / (1024 * 1024):.1f} MB")
+    print(f"  Chunks reassembled: {result.chunk_count}")
+    print(f"  Drive file id: {result.master_file_id}")
+    print("  Source chunks have been deleted from Drive.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="drive_manager.py",
@@ -49,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         "list-projects", help="List existing projects in Drive"
     )
     list_parser.set_defaults(func=cmd_list_projects)
+
+    reconstruct_parser = subparsers.add_parser(
+        "reconstruct", help="Verify and reassemble a recording session's chunks into a master video"
+    )
+    reconstruct_parser.add_argument("session_id", help="Session ID tagged on the phone-uploaded chunks")
+    reconstruct_parser.set_defaults(func=cmd_reconstruct)
 
     return parser
 
