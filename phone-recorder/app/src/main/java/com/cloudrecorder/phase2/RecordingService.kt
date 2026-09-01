@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
@@ -245,8 +246,14 @@ class RecordingService : LifecycleService() {
                 val capture = VideoCapture.withOutput(recorder)
                 videoCapture = capture
 
+                // Bound in the same bindToLifecycle call as the recording use case, on
+                // the same camera session — this does not affect VideoCapture whether
+                // or not anything is actually attached to it as a frame consumer.
+                val previewUseCase = Preview.Builder().build()
+
                 provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, capture)
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, capture, previewUseCase)
+                CameraPreviewBridge.preview.value = previewUseCase
 
                 EventLogger.log(
                     LogLevel.INFO,
@@ -425,6 +432,7 @@ class RecordingService : LifecycleService() {
 
         tickerJob?.cancel()
         cameraProvider?.unbindAll()
+        CameraPreviewBridge.preview.value = null
         releaseWakeLock()
 
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -470,6 +478,7 @@ class RecordingService : LifecycleService() {
         }
         RecordingState.isServiceRunning.value = false
         tickerJob?.cancel()
+        CameraPreviewBridge.preview.value = null
         releaseWakeLock()
         super.onDestroy()
     }

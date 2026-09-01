@@ -20,6 +20,11 @@ private const val DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
 private const val DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3/files"
 private const val FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 
+sealed class CreateProjectResult {
+    data class Created(val projectFolderId: String) : CreateProjectResult()
+    object AlreadyExists : CreateProjectResult()
+}
+
 sealed class ResumeCheck {
     data class Complete(val driveFileId: String) : ResumeCheck()
     data class InProgress(val bytesReceived: Long) : ResumeCheck()
@@ -91,6 +96,25 @@ object DriveRestClient {
         val projects = ensureFolder(accessToken, "Projects", root)
         val project = ensureFolder(accessToken, projectName, projects)
         return ensureFolder(accessToken, "Original", project)
+    }
+
+    /**
+     * Creates a brand-new project's full folder set (Original/Proxy/Audio/Resolve),
+     * mirroring Phase 1's desktop `create-project` exactly. Refuses (AlreadyExists)
+     * rather than silently reusing an existing project of the same name, consistent
+     * with the desktop CLI's DuplicateProjectError behavior.
+     */
+    suspend fun createProjectStructure(accessToken: String, projectName: String): CreateProjectResult {
+        val root = ensureFolder(accessToken, "Content Creation", null)
+        val projects = ensureFolder(accessToken, "Projects", root)
+
+        if (findFolder(accessToken, projectName, projects) != null) {
+            return CreateProjectResult.AlreadyExists
+        }
+
+        val project = createFolder(accessToken, projectName, projects)
+        listOf("Original", "Proxy", "Audio", "Resolve").forEach { createFolder(accessToken, it, project) }
+        return CreateProjectResult.Created(project)
     }
 
     /** POSTs metadata and returns the resumable session URI (the response's Location header). */

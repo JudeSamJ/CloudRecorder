@@ -2,6 +2,7 @@ package com.cloudrecorder.phase2.ui
 
 import android.content.Context
 import android.os.Environment
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -18,6 +19,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -26,26 +28,35 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.camera.video.Quality
+import androidx.camera.view.PreviewView
+import com.cloudrecorder.phase2.CameraPreviewBridge
 import com.cloudrecorder.phase2.EventLogger
 import com.cloudrecorder.phase2.LogLevel
 import com.cloudrecorder.phase2.QualityUtils
 import com.cloudrecorder.phase2.RecordingService
 import com.cloudrecorder.phase2.RecordingState
 import com.cloudrecorder.phase2.StorageMonitor
+import com.cloudrecorder.phase2.upload.CreateProjectResult
+import com.cloudrecorder.phase2.upload.DriveAuthManager
+import com.cloudrecorder.phase2.upload.DriveRestClient
 import com.cloudrecorder.phase2.upload.UploadRepository
 import com.cloudrecorder.phase2.upload.UploadStats
+import kotlinx.coroutines.launch
 import java.io.File
 
 @Composable
@@ -108,6 +119,8 @@ private fun RecordingContent(
     val uploadStats by RecordingState.uploadStats.collectAsState()
 
     var showClearConfirm by remember { mutableStateOf(false) }
+    var isCreatingProject by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
 
     Scaffold { padding ->
         Column(
@@ -142,6 +155,24 @@ private fun RecordingContent(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        isCreatingProject = true
+                        coroutineScope.launch {
+                            createNewProject(context, projectName) { isCreatingProject = false }
+                        }
+                    },
+                    enabled = !isCreatingProject && projectName.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (isCreatingProject) {
+                        CircularProgressIndicator(modifier = Modifier.height(16.dp), strokeWidth = 2.dp)
+                        Text("  Creating...")
+                    } else {
+                        Text("Create New Project in Drive")
+                    }
+                }
                 Spacer(Modifier.height(12.dp))
 
                 QualityPicker(
@@ -155,6 +186,11 @@ private fun RecordingContent(
                     onSelect = { RecordingState.chunkIntervalSeconds.value = it },
                 )
                 Spacer(Modifier.height(16.dp))
+            }
+
+            if (isRecording) {
+                CameraPreview(modifier = Modifier.fillMaxWidth().height(280.dp))
+                Spacer(Modifier.height(12.dp))
             }
 
             StatsCard(
@@ -223,6 +259,58 @@ private fun RecordingContent(
                 OutlinedButton(onClick = { showClearConfirm = false }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/**
+ * Live feed from RecordingService's camera binding, attached via CameraPreviewBridge.
+ * Recording itself runs entirely in the service regardless of whether this is ever
+ * shown — this just gives the Preview use case a Surface to render into while the
+ * Activity is visible; nothing here affects background recording reliability.
+ */
+@Composable
+private fun CameraPreview(modifier: Modifier = Modifier) {
+    val previewUseCase by CameraPreviewBridge.preview.collectAsState()
+    val context = LocalContext.current
+    val previewView = remember {
+        PreviewView(context).apply { implementationMode = PreviewView.ImplementationMode.PERFORMANCE }
+    }
+
+    AndroidView(modifier = modifier, factory = { previewView })
+
+    LaunchedEffect(previewUseCase) {
+        previewUseCase?.setSurfaceProvider(previewView.surfaceProvider)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { previewUseCase?.setSurfaceProvider(null) }
+    }
+}
+
+private suspend fun createNewProject(context: Context, projectName: String, onDone: () -> Unit) {
+    try {
+        val accessToken = DriveAuthManager.getAccessToken(context)
+        when (val result = DriveRestClient.createProjectStructure(accessToken, projectName)) {
+            is CreateProjectResult.Created -> {
+                Toast.makeText(context, "Created project '$projectName' in Drive", Toast.LENGTH_SHORT).show()
+                EventLogger.log(LogLevel.INFO, "Created new project '$projectName' in Drive (folder id=${result.projectFolderId})")
+            }
+            CreateProjectResult.AlreadyExists -> {
+                Toast.makeText(context, "Project '$projectName' already exists", Toast.LENGTH_SHORT).show()
+                EventLogger.log(LogLevel.WARN, "Create project: '$projectName' already exists in Drive")
+            }
+        }
+    } catch (e: DriveAuthManager.NotSignedInException) {
+        Toast.makeText(context, "Sign in with Google first", Toast.LENGTH_SHORT).show()
+        EventLogger.log(LogLevel.ERROR, "Create project failed: not signed in")
+    } catch (e: DriveAuthManager.RecoverableAuthException) {
+        Toast.makeText(context, "Needs re-authentication — sign in again", Toast.LENGTH_SHORT).show()
+        EventLogger.log(LogLevel.ERROR, "Create project failed: needs re-authentication")
+    } catch (e: Exception) {
+        Toast.makeText(context, "Create project failed: ${e.message}", Toast.LENGTH_LONG).show()
+        EventLogger.log(LogLevel.ERROR, "Create project '$projectName' failed: ${e.message}")
+    } finally {
+        onDone()
     }
 }
 

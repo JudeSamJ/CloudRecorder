@@ -32,6 +32,13 @@ object DriveAuthManager {
     fun signInClient(context: Context): GoogleSignInClient {
         val options = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
             .requestScopes(Scope(SCOPE_DRIVE_FILE))
+            // DEFAULT_SIGN_IN alone does not request the email scope, so without
+            // this GoogleSignInAccount.email is always null — sign-in succeeds
+            // (drive.file is granted, currentAccount() works fine) but currentEmail()
+            // silently returns null forever, so the UI never shows as signed in even
+            // though it genuinely is. Confirmed via the actual cached account: scopes
+            // were ["drive.file", "openid", "profile"] with no email/email-scope.
+            .requestEmail()
             .build()
         return GoogleSignIn.getClient(context, options)
     }
