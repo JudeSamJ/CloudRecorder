@@ -49,11 +49,21 @@ def probe_duration_seconds(path: Path) -> float:
 
 
 def probe_resolution(path: Path) -> tuple[int, int]:
-    """Returns (width, height) of the first video stream via ffprobe."""
+    """Returns the DISPLAYED (width, height) of the first video stream, accounting
+    for rotation metadata. Phone-recorded portrait video is very commonly stored as
+    landscape pixel dimensions plus a +/-90 degree rotation flag (a display matrix
+    side-data entry, or the older 'rotate' stream tag) that players apply when
+    showing it — e.g. raw 1920x1080 pixels displayed as 1080x1920 portrait. Returning
+    the raw, un-rotated dimensions here would size a proxy at the wrong aspect ratio
+    and orientation entirely: confirmed by hand against a real portrait recording,
+    where the resulting proxy failed DaVinci Resolve's LinkProxyMedia outright
+    (Resolve validates the proxy's dimensions against the original's true displayed
+    ones) and would in any case have looked visibly squashed."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height", "-of", "json", str(path),
+            "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+            "-of", "json", str(path),
         ],
         capture_output=True, text=True,
     )
@@ -62,9 +72,30 @@ def probe_resolution(path: Path) -> tuple[int, int]:
     try:
         data = json.loads(result.stdout)
         stream = data["streams"][0]
-        return int(stream["width"]), int(stream["height"])
+        width = int(stream["width"])
+        height = int(stream["height"])
     except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
         raise FFmpegError(f"ffprobe returned unexpected output for {path.name}: {exc}") from exc
+
+    if _rotation_degrees(stream) % 180 == 90:
+        width, height = height, width
+    return width, height
+
+
+def _rotation_degrees(stream: dict) -> int:
+    for side_data in stream.get("side_data_list", []):
+        if "rotation" in side_data:
+            try:
+                return int(side_data["rotation"]) % 360
+            except (TypeError, ValueError):
+                pass
+    rotate_tag = (stream.get("tags") or {}).get("rotate")
+    if rotate_tag:
+        try:
+            return int(rotate_tag) % 360
+        except ValueError:
+            pass
+    return 0
 
 
 def write_concat_list(chunk_paths: list[Path], list_file_path: Path) -> None:
