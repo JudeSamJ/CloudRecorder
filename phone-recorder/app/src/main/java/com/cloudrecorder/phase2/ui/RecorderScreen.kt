@@ -188,6 +188,8 @@ private fun SetupContent(
 ) {
     val availableQualities by RecordingState.availableQualities.collectAsState()
     val selectedQuality by RecordingState.selectedQuality.collectAsState()
+    val availableFrameRates by RecordingState.availableFrameRates.collectAsState()
+    val selectedFrameRate by RecordingState.selectedFrameRate.collectAsState()
     val chunkInterval by RecordingState.chunkIntervalSeconds.collectAsState()
     val chunkCount by RecordingState.chunkCount.collectAsState()
     val totalBytes by RecordingState.totalBytes.collectAsState()
@@ -266,6 +268,12 @@ private fun SetupContent(
                 onSelect = { RecordingState.selectedQuality.value = it },
             )
             Spacer(Modifier.height(8.dp))
+            FrameRatePicker(
+                available = availableFrameRates,
+                selected = selectedFrameRate,
+                onSelect = { RecordingState.selectedFrameRate.value = it },
+            )
+            Spacer(Modifier.height(8.dp))
             ChunkIntervalPicker(
                 selected = chunkInterval,
                 onSelect = { RecordingState.chunkIntervalSeconds.value = it },
@@ -290,7 +298,7 @@ private fun SetupContent(
                     onClick = {
                         val quality = selectedQuality ?: Quality.HD
                         context.startForegroundService(
-                            RecordingService.startIntent(context, quality, chunkInterval, projectName),
+                            RecordingService.startIntent(context, quality, selectedFrameRate, chunkInterval, projectName),
                         )
                     },
                     enabled = selectedQuality != null && projectName.isNotBlank(),
@@ -459,6 +467,23 @@ private fun QualityPicker(available: List<Quality>, selected: Quality?, onSelect
                         label = { Text(QualityUtils.name(quality)) },
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FrameRatePicker(available: List<Int>, selected: Int, onSelect: (Int) -> Unit) {
+    Column {
+        Text("Frame rate (detected on this device)", style = MaterialTheme.typography.labelLarge)
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            available.forEach { fps ->
+                FilterChip(
+                    selected = fps == selected,
+                    onClick = { onSelect(fps) },
+                    label = { Text("${fps}fps") },
+                )
             }
         }
     }

@@ -15,6 +15,8 @@ object RecordingState {
 
     val availableQualities = MutableStateFlow<List<Quality>>(emptyList())
     val selectedQuality = MutableStateFlow<Quality?>(null)
+    val availableFrameRates = MutableStateFlow<List<Int>>(listOf(30))
+    val selectedFrameRate = MutableStateFlow(30)
     val chunkIntervalSeconds = MutableStateFlow(8)
     val projectName = MutableStateFlow("")
     val signedInEmail = MutableStateFlow<String?>(null)

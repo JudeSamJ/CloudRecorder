@@ -2,11 +2,14 @@ package com.cloudrecorder.phase2
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.QualitySelector
@@ -109,10 +112,11 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Queries the device's actually-supported recording qualities up front so the UI
-     * can offer only real options (spec requires detecting, not hardcoding, 1080p/4K
-     * availability). This does not bind a use case or open the camera for capture —
-     * just reads capabilities off CameraInfo.
+     * Queries the device's actually-supported recording qualities and frame rates up
+     * front so the UI offers only real options (detecting, not hardcoding, what
+     * 1080p/4K/60fps/etc. this specific device/camera can do). This does not bind a
+     * use case or open the camera for capture — just reads capabilities off
+     * CameraInfo/CameraCharacteristics.
      */
     private fun probeSupportedQualities() {
         val future = ProcessCameraProvider.getInstance(this)
@@ -127,13 +131,33 @@ class MainActivity : ComponentActivity() {
                 RecordingState.availableQualities.value = supported
 
                 if (RecordingState.selectedQuality.value == null) {
-                    val ordered = QualityUtils.sortedHighestFirst(supported)
-                    RecordingState.selectedQuality.value =
-                        ordered.firstOrNull { QualityUtils.name(it) == "FHD" } ?: ordered.firstOrNull()
+                    // Default to the highest quality this device supports, per the
+                    // usual recording preference — user can still pick a lower one.
+                    RecordingState.selectedQuality.value = QualityUtils.sortedHighestFirst(supported).firstOrNull()
+                }
+
+                val frameRates = supportedFixedFrameRates(cameraInfo)
+                RecordingState.availableFrameRates.value = frameRates
+                if (RecordingState.selectedFrameRate.value !in frameRates) {
+                    RecordingState.selectedFrameRate.value = frameRates.firstOrNull { it == 30 } ?: frameRates.first()
                 }
             } catch (e: Exception) {
                 EventLogger.log(LogLevel.ERROR, "Failed to probe supported qualities: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * Fixed FPS targets (24/30/60) filtered down to only those actually within one of
+     * this camera's reported CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES — never offering a
+     * frame rate the hardware can't actually deliver, rather than hardcoding the list.
+     */
+    private fun supportedFixedFrameRates(cameraInfo: CameraInfo): List<Int> {
+        val candidates = listOf(24, 30, 60)
+        val ranges = Camera2CameraInfo.from(cameraInfo)
+            .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?: return listOf(30)
+        val supported = candidates.filter { fps -> ranges.any { fps in it.lower..it.upper } }
+        return supported.ifEmpty { listOf(30) }
     }
 }

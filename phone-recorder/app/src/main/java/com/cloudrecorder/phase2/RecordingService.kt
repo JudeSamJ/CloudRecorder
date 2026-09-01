@@ -60,18 +60,26 @@ class RecordingService : LifecycleService() {
         const val ACTION_START = "com.cloudrecorder.phase2.action.START"
         const val ACTION_STOP = "com.cloudrecorder.phase2.action.STOP"
         const val EXTRA_QUALITY_NAME = "quality_name"
+        const val EXTRA_FRAME_RATE = "frame_rate"
         const val EXTRA_CHUNK_INTERVAL_SECONDS = "chunk_interval_seconds"
         const val EXTRA_PROJECT_NAME = "project_name"
 
         private const val CHANNEL_ID = "recording_channel"
         private const val NOTIFICATION_ID = 1001
         private const val GAP_WARN_THRESHOLD_MS = 300L
-        private const val TARGET_FPS = 30
+        private const val DEFAULT_FPS = 30
 
-        fun startIntent(context: Context, quality: Quality, chunkIntervalSeconds: Int, projectName: String): Intent =
+        fun startIntent(
+            context: Context,
+            quality: Quality,
+            frameRate: Int,
+            chunkIntervalSeconds: Int,
+            projectName: String,
+        ): Intent =
             Intent(context, RecordingService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_QUALITY_NAME, QualityUtils.name(quality))
+                putExtra(EXTRA_FRAME_RATE, frameRate)
                 putExtra(EXTRA_CHUNK_INTERVAL_SECONDS, chunkIntervalSeconds)
                 putExtra(EXTRA_PROJECT_NAME, projectName)
             }
@@ -123,6 +131,7 @@ class RecordingService : LifecycleService() {
         if (RecordingState.isServiceRunning.value) return
 
         val quality = QualityUtils.fromName(intent.getStringExtra(EXTRA_QUALITY_NAME))
+        val frameRate = intent.getIntExtra(EXTRA_FRAME_RATE, DEFAULT_FPS)
         val intervalSeconds = intent.getIntExtra(EXTRA_CHUNK_INTERVAL_SECONDS, 8)
         projectName = intent.getStringExtra(EXTRA_PROJECT_NAME)?.trim().takeUnless { it.isNullOrEmpty() }
             ?: "Untitled"
@@ -144,7 +153,7 @@ class RecordingService : LifecycleService() {
         acquireWakeLock()
         startForegroundNotification()
         startTicker(intervalSeconds)
-        initCameraAndBegin(quality)
+        initCameraAndBegin(quality, frameRate)
     }
 
     private fun createSessionDir(): File {
@@ -219,7 +228,7 @@ class RecordingService : LifecycleService() {
         }
     }
 
-    private fun initCameraAndBegin(requestedQuality: Quality) {
+    private fun initCameraAndBegin(requestedQuality: Quality, frameRate: Int) {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
@@ -254,7 +263,7 @@ class RecordingService : LifecycleService() {
                 // recording and preview use cases since they share one capture session.
                 val captureBuilder = VideoCapture.Builder(recorder)
                 Camera2Interop.Extender(captureBuilder).setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS),
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(frameRate, frameRate),
                 )
                 val capture = captureBuilder.build()
                 videoCapture = capture
@@ -264,7 +273,7 @@ class RecordingService : LifecycleService() {
                 // or not anything is actually attached to it as a frame consumer.
                 val previewBuilder = Preview.Builder()
                 Camera2Interop.Extender(previewBuilder).setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS),
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(frameRate, frameRate),
                 )
                 val previewUseCase = previewBuilder.build()
 
@@ -276,7 +285,7 @@ class RecordingService : LifecycleService() {
                 EventLogger.log(
                     LogLevel.INFO,
                     "Camera bound. Requested quality=${QualityUtils.name(requestedQuality)}, " +
-                        "using=${QualityUtils.name(effectiveQuality)}, " +
+                        "using=${QualityUtils.name(effectiveQuality)}, frameRate=${frameRate}fps, " +
                         "device supports=${supported.joinToString { QualityUtils.name(it) }}",
                 )
 
