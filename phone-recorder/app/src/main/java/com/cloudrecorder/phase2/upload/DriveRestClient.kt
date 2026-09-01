@@ -10,6 +10,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
@@ -71,7 +72,11 @@ object DriveRestClient {
             val metadata = JSONObject().apply {
                 put("name", name)
                 put("mimeType", FOLDER_MIME_TYPE)
-                if (parentId != null) put("parents", listOf(parentId))
+                // Explicit JSONArray, not put("parents", listOf(parentId)) -- org.json does
+                // not reliably serialize a raw Kotlin List as a JSON array here; it was
+                // silently producing a malformed "parents" field, which Drive ignored,
+                // creating every folder at My Drive root instead of nested where intended.
+                if (parentId != null) put("parents", JSONArray().put(parentId))
             }
             val url = "$DRIVE_API_BASE/files?fields=id"
             val body = metadata.toString().toRequestBody("application/json".toMediaType())
@@ -127,7 +132,7 @@ object DriveRestClient {
     ): String = withContext(Dispatchers.IO) {
         val metadata = JSONObject().apply {
             put("name", fileName)
-            put("parents", listOf(folderId))
+            put("parents", JSONArray().put(folderId))
             put("appProperties", JSONObject(appProperties))
         }
         val url = "$DRIVE_UPLOAD_BASE?uploadType=resumable"
@@ -235,7 +240,7 @@ object DriveRestClient {
     ): String = withContext(Dispatchers.IO) {
         val metadata = JSONObject().apply {
             put("name", fileName)
-            put("parents", listOf(folderId))
+            put("parents", JSONArray().put(folderId))
             put("appProperties", JSONObject(appProperties))
         }
         val body = MultipartBody.Builder()
