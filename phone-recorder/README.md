@@ -217,6 +217,16 @@ Each uploaded file is named `<sessionId>_chunk_NNNN.mp4` and tagged with Drive
 `appProperties` (`sessionId`, `chunkIndex`, `recordedAtMs`) so Phase 4 can later
 verify a session's chunks are all present and correctly ordered.
 
+**Phase 6 addition:** once a *stopped* session's chunks are all confirmed
+`UPLOADED`, the app also uploads a small `<sessionId>_complete.json` marker
+(tagged `appProperties: {sessionId, kind: session_complete, projectName,
+chunkCount, totalBytes}`) to the same `Original/` folder. This is the
+deterministic "this session is genuinely done" signal the Phase 6 desktop
+companion watches for — see the root `README.md`'s Phase 6 section. It's written
+by a separate `SessionMarkerWorker`, only enqueued once, and never written for a
+session that was still recording when the app or its foreground service was
+killed (an OS-kill can't know the true final chunk count).
+
 ## Test protocol: simulating real-world network flakiness
 
 For all three, start a recording with a short chunk length (5s) so you get several

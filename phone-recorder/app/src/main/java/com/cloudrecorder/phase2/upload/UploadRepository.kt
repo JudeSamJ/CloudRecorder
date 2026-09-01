@@ -34,6 +34,7 @@ data class UploadStats(
 class UploadRepository(private val context: Context) {
 
     private val dao = UploadDatabase.get(context).chunkUploadDao()
+    private val sessionDao = UploadDatabase.get(context).sessionDao()
     private val workManager = WorkManager.getInstance(context)
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -111,6 +112,50 @@ class UploadRepository(private val context: Context) {
                 scheduleWork(entity.chunkId)
             }
         }
+        // Also covers the case where every chunk finished uploading but the app died
+        // before the marker itself got enqueued (e.g. right after the last chunk's
+        // markUploaded() call) — without this, that session would silently never get
+        // its Phase 6 completion marker.
+        sessionDao.getAllMarkerPending().forEach { session -> maybeScheduleMarker(session.sessionId) }
+    }
+
+    /**
+     * Call once recording for a session has genuinely stopped (RecordingService's
+     * normal finishStopSequence — never from an OS-kill onDestroy, which doesn't
+     * know the true final chunk count). Records the expected chunk count so upload
+     * completion can be detected, then checks immediately in case every chunk
+     * already finished uploading before recording even stopped.
+     */
+    fun markSessionRecordingComplete(sessionId: String, projectName: String, chunkCount: Int, totalBytes: Long) {
+        if (chunkCount <= 0) return
+        repositoryScope.launch {
+            sessionDao.upsert(
+                SessionEntity(
+                    sessionId = sessionId,
+                    projectName = projectName,
+                    expectedChunkCount = chunkCount,
+                    totalBytes = totalBytes,
+                    recordingFinishedAtMs = System.currentTimeMillis(),
+                ),
+            )
+            maybeScheduleMarker(sessionId)
+        }
+    }
+
+    /** Called after every chunk upload completes — enqueues the session marker
+     * exactly once all of a finished session's chunks are confirmed UPLOADED. */
+    suspend fun maybeScheduleMarker(sessionId: String) {
+        val session = sessionDao.getById(sessionId) ?: return
+        if (session.markerUploaded) return
+        val uploadedCount = sessionDao.countUploadedChunks(sessionId)
+        if (uploadedCount < session.expectedChunkCount) return
+
+        val request = OneTimeWorkRequestBuilder<SessionMarkerWorker>()
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .setInputData(SessionMarkerWorker.inputData(sessionId))
+            .build()
+        workManager.enqueueUniqueWork("marker_$sessionId", ExistingWorkPolicy.KEEP, request)
     }
 
     fun retryNow(chunkId: String) {

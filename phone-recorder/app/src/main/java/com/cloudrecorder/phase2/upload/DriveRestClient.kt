@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -189,6 +190,49 @@ object DriveRestClient {
         client.newCall(request).execute().use { response ->
             val text = response.body?.string()
             if (!response.isSuccessful) throw driveError("uploadRemaining", response.code, text)
+            JSONObject(text ?: "{}").getString("id")
+        }
+    }
+
+    /**
+     * Single-request multipart upload for small metadata files (Phase 6's session
+     * completion marker) — the resumable protocol above exists for large video
+     * chunks where a dropped connection mid-upload matters; for a few hundred bytes
+     * of JSON, one multipart POST is simpler and there's nothing meaningful to
+     * resume anyway.
+     */
+    suspend fun uploadSmallFile(
+        accessToken: String,
+        fileName: String,
+        folderId: String,
+        content: ByteArray,
+        mimeType: String,
+        appProperties: Map<String, String>,
+    ): String = withContext(Dispatchers.IO) {
+        val metadata = JSONObject().apply {
+            put("name", fileName)
+            put("parents", listOf(folderId))
+            put("appProperties", JSONObject(appProperties))
+        }
+        val body = MultipartBody.Builder()
+            .setType("multipart/related".toMediaType())
+            .addPart(
+                MultipartBody.Part.create(
+                    null,
+                    metadata.toString().toRequestBody("application/json; charset=UTF-8".toMediaType()),
+                ),
+            )
+            .addPart(MultipartBody.Part.create(null, content.toRequestBody(mimeType.toMediaType())))
+            .build()
+
+        val url = "$DRIVE_UPLOAD_BASE?uploadType=multipart&fields=id"
+        val request = Request.Builder().url(url)
+            .header("Authorization", "Bearer $accessToken")
+            .post(body)
+            .build()
+        client.newCall(request).execute().use { response ->
+            val text = response.body?.string()
+            if (!response.isSuccessful) throw driveError("uploadSmallFile($fileName)", response.code, text)
             JSONObject(text ?: "{}").getString("id")
         }
     }

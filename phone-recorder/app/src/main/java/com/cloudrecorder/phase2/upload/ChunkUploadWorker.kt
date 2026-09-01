@@ -86,6 +86,7 @@ class ChunkUploadWorker(context: Context, params: WorkerParameters) : CoroutineW
             val deleted = file.delete()
             if (deleted) dao.markLocalFileDeleted(chunkId)
             EventLogger.log(LogLevel.INFO, "Chunk ${entity.chunkId} uploaded to Drive (id=$driveFileId)")
+            UploadRepository.getInstance(applicationContext).maybeScheduleMarker(entity.sessionId)
             Result.success()
         } catch (e: Exception) {
             handleTransientFailure(entity, "Upload failed: ${e.message}")

@@ -411,6 +411,13 @@ class RecordingService : LifecycleService() {
         )
         EventLogger.endSession()
 
+        // Phase 6 completion signal: only from this normal-stop path, never from the
+        // OS-kill branch in onDestroy() below, which doesn't know the true final
+        // chunk count.
+        if (chunkIndex > 0) {
+            uploadRepository.markSessionRecordingComplete(sessionId, projectName, chunkIndex, totalBytesAccum)
+        }
+
         tickerJob?.cancel()
         cameraProvider?.unbindAll()
         releaseWakeLock()

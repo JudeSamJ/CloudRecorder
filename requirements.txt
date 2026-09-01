@@ -1,3 +1,7 @@
 google-auth>=2.29.0
 google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.126.0
+
+# Phase 6: desktop companion tray app
+pystray>=0.19.5
+pillow>=10.3.0

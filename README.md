@@ -454,3 +454,178 @@ Proxy generation succeeded.
   rather than a problem with the generated file itself, worth flagging back
   since it would mean the convention needs adjusting for your Resolve
   version specifically.
+
+---
+
+# Phase 6: desktop companion (background orchestration)
+
+A system tray app (`companion_app.py`) that watches Drive for sessions the phone
+app has finished uploading, and automatically chains Phase 4 reconstruction into
+Phase 5 proxy generation — so you don't run `reconstruct` and `generate-proxy` by
+hand after every recording. `drive_manager.py`'s commands still work completely
+independently; the tray app is an orchestration layer on top, not a replacement.
+
+```
+python companion_app.py
+```
+
+## Design decisions
+
+**Tray app, not a Windows service.** A Windows service runs in Session 0 with no
+UI access at all — it could not show status even in principle, which is the
+opposite of "favor visibility." A tray app gives an always-visible status icon
+(color-coded: green = idle/nothing waiting, amber = actively working, red = a
+session needs your attention) plus a full dashboard window on click, at no real
+cost for a single-user local app.
+
+**Session-complete signal: a Drive marker file, not an idle-timeout guess.** The
+phone app (Phase 3 addition) writes `<sessionId>_complete.json` — tagged
+`appProperties: {sessionId, kind: session_complete, projectName, chunkCount,
+totalBytes}` — once every chunk of a *stopped* recording session is confirmed
+uploaded. The companion only ever auto-triggers reconstruction for a session once
+this marker exists, so it's deterministic: no risk of firing mid-recording, no
+"was that pause 15 minutes or is upload just slow" guessing a pure idle-timeout
+approach would have.
+
+**Local state: SQLite (`companion_state.db`, stdlib `sqlite3`), not a database
+server.** Justified specifically because session stage needs to be (a) queryable
+by stage — "everything AWAITING_RECONSTRUCTION" — and (b) durable across a
+restart with zero special-case recovery code: the poll loop just reads whatever
+each session's row currently says. A flat JSON file would need hand-rolled atomic
+writes to be crash-safe against the same failure modes SQLite already handles;
+that's infrastructure this single-user tool doesn't need to build itself.
+
+**Restart safety falls out of the design, it isn't a special code path.** Every
+session's pipeline stage lives in SQLite, not in memory. Closing the app mid-
+reconstruction just leaves that session's row at `RECONSTRUCTING` (or wherever it
+was); relaunching starts the same poll loop, which picks that row up again on its
+next pass exactly as if nothing had happened — restart handling is "there is no
+special restart handling," not an added feature.
+
+**One session processed at a time, on one background thread.** No concurrency
+here deliberately: this is a low-volume single-user tool, and running two ffmpeg
+jobs at once would only contend for the same CPU/disk. On success, reconstruction
+chains straight into proxy generation for that session rather than waiting for
+the next 30s poll — nothing is gained by deferring a step that's already proven
+Drive/ffmpeg are working.
+
+**Manual overrides operate on local state only, never bypass the completeness
+check.** Pause/Resume just sets a flag the poll loop skips. Retry resets a
+`FAILED_*` session back to the `AWAITING_*` stage before it. "Process now" runs
+the next step immediately instead of waiting for the poll interval — it still
+only works on a session already in an `AWAITING_*` stage, i.e. one whose Drive
+marker already proved upload was complete; there's no "start reconstruction on a
+still-uploading session" button, since that would produce exactly the corrupt/
+incomplete master Phase 4's own validation exists to prevent.
+
+**Known race (accepted, not worked around):** if you click "Process now" on a
+session in the same instant the 30-second poll picks it up too, both could start
+reconstructing it concurrently. Phase 4's own idempotency guard
+(`MasterAlreadyExistsError`) means the loser fails loudly rather than corrupting
+anything — a duplicate-work edge case, not a duplicate-data one. Not worth adding
+a lock for in a single-user tool for how rarely the timing would actually collide.
+
+**Android-side cost of this phase:** the phone app's local Room database schema
+changed (a new `sessions` table) and uses `fallbackToDestructiveMigration()`
+rather than a hand-written migration. Any chunk sitting `PENDING`/`FAILED` in the
+upload queue at the moment you update the phone app gets dropped from that
+database (the video file itself is untouched on disk, but you'd need to
+re-trigger its upload manually, or just re-record). Reasonable given this is
+still active cross-phase development, not long-lived production queue state.
+
+## Setup
+
+No new Google Cloud setup — reuses Phase 1's `credentials.json`/`token.json`.
+
+Run `python companion_app.py` once to confirm it launches (a tray icon should
+appear). To have it start automatically when you log into Windows:
+
+1. Press `Win+R`, type `shell:startup`, Enter — opens your Startup folder.
+2. Create a shortcut there targeting:
+   `pythonw.exe C:\path\to\CloudRecorder\companion_app.py`
+   (use `pythonw.exe`, not `python.exe` — it runs without popping up a console
+   window, matching the tray app's own "background, but visible via the icon"
+   design).
+
+## Tray UI: what each state means
+
+- **Icon color:** green = nothing waiting on you, everything either idle or
+  `READY`. Amber = actively reconstructing or generating a proxy right now. Red =
+  at least one session is `FAILED_RECONSTRUCTION` or `FAILED_PROXY` — open the
+  dashboard.
+- **Tray menu status line:** `N ready · N working · N waiting · N failed` — a
+  glance without opening the dashboard.
+- **Dashboard table**, one row per session: session ID, project, current stage
+  (`Awaiting reconstruction` / `Reconstructing...` / `Awaiting proxy generation` /
+  `Generating proxy...` / `Ready to edit` / `FAILED (reconstruction)` /
+  `FAILED (proxy generation)`, `(paused)` suffix if paused), last-updated
+  timestamp, and the error message for any failed session.
+- **Recent activity log** at the bottom of the dashboard — every step the
+  orchestrator takes, per session, in plain text (mirrors what
+  `reconstruct`/`generate-proxy` print when run manually).
+
+## Test protocol
+
+### 1. Normal end-to-end flow
+
+1. Launch `python companion_app.py` — confirm the tray icon appears (green,
+   nothing to do yet).
+2. Record a short session on the phone app and let it fully upload (Upload
+   status card shows all chunks `Uploaded`).
+3. Within ~30s (the poll interval), the tray icon should turn amber and the
+   dashboard should show the session appear at `Awaiting reconstruction`, then
+   `Reconstructing...`, then `Awaiting proxy generation`, then
+   `Generating proxy...`, then `Ready to edit` — with matching lines in the
+   activity log at each step, and the icon returning to green once nothing is
+   left waiting.
+4. Confirm in Drive: chunks gone from `Original/` (deleted post-reconstruction),
+   `<sessionId>_master.mp4` present, a proxy `.mov` in `Proxy/`.
+
+### 2. The main scenario you asked for: close mid-upload, relaunch, confirm resume
+
+1. Start a recording on the phone with a short chunk length (5s), so uploads are
+   frequent and easy to catch mid-flight.
+2. **Before** the phone finishes uploading everything (i.e. before the phone
+   writes its completion marker — check the phone's Upload status card still
+   shows `Pending`/`Uploading`), stop the phone recording, then close the
+   companion app entirely (Quit from the tray menu, not just closing the
+   dashboard window).
+3. Let the phone finish uploading all its chunks and writing its completion
+   marker fully in the background (the phone app doesn't need the companion
+   running for this — Phase 3's upload queue is independent).
+4. Relaunch `python companion_app.py`.
+5. **Check:** within moments (the immediate startup poll, not waiting the full
+   30s), the dashboard shows that session appear directly at
+   `Awaiting reconstruction` (its marker was already sitting in Drive, unseen
+   until now), and it proceeds through reconstruction and proxy generation
+   exactly as in test 1 — nothing was lost, nothing needed manual re-triggering.
+
+### 3. Manual overrides
+
+1. While a session is `Awaiting reconstruction`, select it in the dashboard and
+   click **Pause** — confirm it stays at that stage indefinitely across poll
+   cycles (does not silently start processing).
+2. Click **Resume** — confirm it picks up on the next poll (or click
+   **Process now** to skip the wait).
+3. Manually delete a chunk from a session's `Original/` folder in Drive *before*
+   its marker would exist — not reachable through the companion normally since a
+   marker only appears once every chunk is confirmed uploaded, so this tests
+   Phase 4's own validation path: manually run `python drive_manager.py
+   reconstruct <id>` for a session with a deliberately broken chunk sequence
+   (per Phase 4's own test protocol above) and confirm the companion, if it also
+   discovers that session's marker, correctly reflects `FAILED (reconstruction)`
+   with the missing-chunk error visible in the dashboard, and that **Retry**
+   after fixing the gap successfully re-processes it.
+
+### What "working correctly" looks like
+
+Sessions move through the dashboard's stages without you touching
+`drive_manager.py` at all, mid-upload closures never lose a session (it just
+resumes at the correct stage after relaunch), and any real failure shows up as a
+red icon with a specific, actionable error in the dashboard — never a silent gap
+you'd only discover later when a proxy you expected isn't there.
+
+## What Phase 6 does not do (by design)
+
+No DaVinci Resolve project file automation (Phase 7) — this phase's job ends the
+moment a validated proxy is sitting synced and ready to edit.
