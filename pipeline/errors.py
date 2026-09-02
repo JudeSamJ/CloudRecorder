@@ -82,3 +82,12 @@ class SessionNotReadyError(PipelineError):
 class LocalSyncNotFoundError(PipelineError):
     """The session's original or proxy file isn't present yet at its expected
     local Drive-for-desktop-synced path."""
+
+
+class QualityMismatchError(PipelineError):
+    """A new session's resolution/fps doesn't match the project's existing master,
+    so it can't be stream-copy-appended without re-encoding (not attempted)."""
+
+
+class SessionAlreadyMergedError(PipelineError):
+    """This session's chunks have already been merged into the project's master."""

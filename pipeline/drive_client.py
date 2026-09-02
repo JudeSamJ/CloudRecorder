@@ -230,6 +230,39 @@ class DriveClient:
         request = self._service.files().get(fileId=file_id, fields=fields)
         return self._execute(request)
 
+    def update_file_content(
+        self,
+        file_id: str,
+        local_path: Path,
+        mime_type: str = "video/mp4",
+        progress_callback=None,
+        app_properties: dict[str, str] | None = None,
+    ) -> str:
+        """Resumable upload that REPLACES an existing file's content in place,
+        keeping the same file id (and Drive's own revision history) rather than
+        creating a new file — used to append to a growing project master/proxy
+        without leaving Resolve (which references by local synced path) pointing
+        at an orphaned, deleted file id."""
+        media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True, chunksize=8 * 1024 * 1024)
+        body = {"appProperties": app_properties} if app_properties else {}
+        request = self._service.files().update(fileId=file_id, body=body, media_body=media, fields="id")
+
+        response = None
+        while response is None:
+            try:
+                status, response = request.next_chunk(num_retries=_CHUNK_NUM_RETRIES)
+            except HttpError as exc:
+                http_status = exc.resp.status if exc.resp is not None else None
+                if http_status == 401:
+                    raise AuthError(
+                        "Google rejected the upload as unauthorized. Delete "
+                        "token.json and re-run to re-authenticate."
+                    ) from exc
+                raise NetworkError(f"Failed updating file {file_id}: {exc}") from exc
+            if status and progress_callback:
+                progress_callback(status.progress())
+        return response["id"]
+
     def delete_file(self, file_id: str) -> None:
         request = self._service.files().delete(fileId=file_id)
         self._execute(request)

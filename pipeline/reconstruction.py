@@ -9,11 +9,23 @@ upload). Given a session ID, this:
   2. Verifies the chunk sequence has no gaps or duplicates before doing any
      work — a corrupt/incomplete sequence must fail loudly, not silently
      produce a partial or misordered master.
-  3. Downloads chunks to a temp directory (~1x final size), stream-copies them
-     into one master file via ffmpeg's concat demuxer (~another 1x final size
-     while both exist), validates duration + decode integrity, and only then
-     uploads the master and deletes the source chunks — in that order, never
-     reversed, since the chunks are the safety net until the master is proven.
+  3. Finds the project's existing master (one master per PROJECT, not per
+     session — every new session's footage is appended to it) and, if one
+     exists, confirms the new chunks' resolution/fps match it before
+     attempting a stream-copy concat; a mismatch refuses cleanly rather than
+     silently corrupting or re-encoding.
+  4. Downloads the existing master (if any) + the new chunks to a temp
+     directory, stream-copies them (existing master first, then new chunks in
+     order) into one combined file via ffmpeg's concat demuxer, validates
+     duration + decode integrity, and only then replaces the master's content
+     in Drive (same file id — see DriveClient.update_file_content) and
+     deletes the source chunks — in that order, never reversed, since the
+     chunks are the safety net until the new combined master is proven.
+
+Note the bandwidth/time tradeoff this implies: every append downloads the
+*entire* existing master, not just the new footage, then re-uploads the
+entire combined result. Fine for occasional short sessions; a project with
+many long sessions will see each append take longer than the last.
 
 The temp directory is always removed (success or failure) via try/finally.
 """
@@ -30,9 +42,10 @@ from typing import Callable
 from pipeline import ffmpeg_tools
 from pipeline.drive_client import DriveClient
 from pipeline.errors import (
-    MasterAlreadyExistsError,
     MissingChunksError,
+    QualityMismatchError,
     ReconstructionValidationError,
+    SessionAlreadyMergedError,
     SessionNotFoundError,
 )
 
@@ -71,8 +84,11 @@ class SessionReconstructor:
         self._progress(f"Looking up chunks for session '{session_id}'...")
         chunks = self._find_chunks(session_id)
         original_folder_id = chunks[0].parent_id
+        project_name = self._project_name_for_folder(original_folder_id)
+        master_name = f"{project_name}_master.mp4"
+
         report: list[str] = [
-            f"Reconstruction report for session {session_id}",
+            f"Reconstruction report for session {session_id} (project '{project_name}')",
             f"Generated: {datetime.now(timezone.utc).isoformat()}",
             f"Chunks found: {len(chunks)}",
         ]
@@ -88,26 +104,44 @@ class SessionReconstructor:
             self._upload_report(report, session_id, original_folder_id)
             raise
 
-        master_name = f"{session_id}_master.mp4"
-        existing = self._client.find_file(master_name, original_folder_id)
-        if existing:
-            raise MasterAlreadyExistsError(
-                f"A master file '{master_name}' already exists in Drive (id={existing['id']}). "
-                "Delete it first if you want to redo reconstruction."
+        existing_master = self._client.find_file(master_name, original_folder_id)
+        existing_props = (existing_master or {}).get("appProperties") or {}
+        merged_ids = [s for s in existing_props.get("mergedSessionIds", "").split(",") if s]
+        if session_id in merged_ids:
+            raise SessionAlreadyMergedError(
+                f"Session '{session_id}' has already been merged into '{master_name}'. "
+                "No chunks remain to re-merge, and nothing was changed."
             )
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f"cloudrecorder_reconstruct_{session_id}_"))
         try:
-            local_paths = self._download_chunks(chunks, temp_dir)
+            segment_paths: list[Path] = []
+            existing_master_path: Path | None = None
+            existing_duration = 0.0
 
-            self._progress("Probing chunk durations...")
-            chunk_durations = [ffmpeg_tools.probe_duration_seconds(path) for path in local_paths]
-            expected_duration = sum(chunk_durations)
-            report.append(f"Sum of chunk durations: {expected_duration:.2f}s")
+            if existing_master:
+                self._progress(f"Downloading existing project master '{master_name}' to append to...")
+                existing_master_path = temp_dir / f"existing_{master_name}"
+                self._client.download_file(existing_master["id"], existing_master_path)
+                existing_duration = ffmpeg_tools.probe_duration_seconds(existing_master_path)
+                report.append(f"Existing master duration before append: {existing_duration:.2f}s")
+                segment_paths.append(existing_master_path)
 
-            self._progress(f"Concatenating {len(local_paths)} chunks with ffmpeg (stream copy)...")
+            new_chunk_paths = self._download_chunks(chunks, temp_dir)
+            segment_paths.extend(new_chunk_paths)
+
+            self._progress("Probing durations and resolution...")
+            if existing_master_path is not None:
+                self._check_quality_matches(existing_master_path, new_chunk_paths[0], master_name)
+
+            new_durations = [ffmpeg_tools.probe_duration_seconds(path) for path in new_chunk_paths]
+            expected_duration = existing_duration + sum(new_durations)
+            report.append(f"Sum of new chunk durations: {sum(new_durations):.2f}s")
+            report.append(f"Expected combined duration: {expected_duration:.2f}s")
+
+            self._progress(f"Concatenating {len(segment_paths)} segment(s) with ffmpeg (stream copy)...")
             list_file = temp_dir / "concat_list.txt"
-            ffmpeg_tools.write_concat_list(local_paths, list_file)
+            ffmpeg_tools.write_concat_list(segment_paths, list_file)
             master_path = temp_dir / master_name
             ffmpeg_tools.concat_to_master(list_file, master_path)
 
@@ -120,22 +154,22 @@ class SessionReconstructor:
                 f"diff {duration_diff:.2f}s, tolerance {tolerance:.2f}s)"
             )
             if duration_diff > tolerance:
-                report.append("Validation: FAILED (duration mismatch). Master NOT uploaded; chunks NOT deleted.")
+                report.append("Validation: FAILED (duration mismatch). Master NOT updated; chunks NOT deleted.")
                 self._upload_report(report, session_id, original_folder_id)
                 raise ReconstructionValidationError(
                     f"Master duration {actual_duration:.2f}s differs from the expected "
                     f"{expected_duration:.2f}s by {duration_diff:.2f}s, exceeding tolerance "
-                    f"{tolerance:.2f}s. Master was NOT uploaded and chunks were NOT deleted."
+                    f"{tolerance:.2f}s. Master was NOT updated and chunks were NOT deleted."
                 )
 
             decode_error = ffmpeg_tools.check_decodes_cleanly(master_path)
             if decode_error:
                 report.append(f"Decode integrity check: FAILED — {decode_error}")
-                report.append("Validation: FAILED. Master NOT uploaded; chunks NOT deleted.")
+                report.append("Validation: FAILED. Master NOT updated; chunks NOT deleted.")
                 self._upload_report(report, session_id, original_folder_id)
                 raise ReconstructionValidationError(
                     f"Master file failed the decode integrity check: {decode_error}. "
-                    "Master was NOT uploaded and chunks were NOT deleted."
+                    "Master was NOT updated and chunks were NOT deleted."
                 )
             report.append("Decode integrity check: OK")
 
@@ -143,18 +177,35 @@ class SessionReconstructor:
             report.append(f"Master size: {master_size} bytes")
             report.append("Validation: PASSED")
 
-            self._progress(f"Uploading master '{master_name}' to Drive...")
-            master_file_id = self._client.upload_file(
-                master_path, original_folder_id, master_name,
-                progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
-                app_properties={"sessionId": session_id, "kind": "master"},
-            )
-            report.append(f"Uploaded master as '{master_name}' (id={master_file_id})")
+            merged_ids.append(session_id)
+            app_properties = {
+                "kind": "master",
+                "projectName": project_name,
+                "latestSessionId": session_id,
+                "mergedSessionIds": ",".join(merged_ids),
+            }
+
+            if existing_master:
+                self._progress(f"Updating project master '{master_name}' in place (appending)...")
+                master_file_id = self._client.update_file_content(
+                    existing_master["id"], master_path,
+                    progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
+                    app_properties=app_properties,
+                )
+                report.append(f"Updated existing master '{master_name}' in place (id={master_file_id})")
+            else:
+                self._progress(f"Uploading new project master '{master_name}' to Drive...")
+                master_file_id = self._client.upload_file(
+                    master_path, original_folder_id, master_name,
+                    progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
+                    app_properties=app_properties,
+                )
+                report.append(f"Uploaded new master '{master_name}' (id={master_file_id})")
 
             self._progress(f"Deleting {len(chunks)} chunk files from Drive...")
             for chunk in chunks:
                 self._client.delete_file(chunk.file_id)
-            report.append(f"Deleted {len(chunks)} chunk files from Drive after confirmed master upload.")
+            report.append(f"Deleted {len(chunks)} chunk files from Drive after confirmed master update.")
 
             report_file_id = self._upload_report(report, session_id, original_folder_id)
             self._progress("Done.")
@@ -173,6 +224,28 @@ class SessionReconstructor:
     def _progress(self, message: str) -> None:
         self._on_progress(message)
 
+    def _project_name_for_folder(self, original_folder_id: str) -> str:
+        """original_folder_id is Content Creation/Projects/<project>/Original —
+        its parent is the project folder, whose name is what we want."""
+        original_folder = self._client.get_file(original_folder_id, fields="id, name, parents")
+        project_folder_id = (original_folder.get("parents") or [None])[0]
+        if not project_folder_id:
+            raise ReconstructionValidationError(
+                f"Folder '{original_folder.get('name')}' (id={original_folder_id}) has no parent project folder."
+            )
+        project_folder = self._client.get_file(project_folder_id, fields="id, name")
+        return project_folder["name"]
+
+    def _check_quality_matches(self, existing_master_path: Path, new_chunk_path: Path, master_name: str) -> None:
+        existing_w, existing_h = ffmpeg_tools.probe_resolution(existing_master_path)
+        new_w, new_h = ffmpeg_tools.probe_resolution(new_chunk_path)
+        if (existing_w, existing_h) != (new_w, new_h):
+            raise QualityMismatchError(
+                f"Cannot append this session ({new_w}x{new_h}) to project master '{master_name}' "
+                f"({existing_w}x{existing_h}) — resolution must match. Re-record at matching quality, "
+                "or use a different project for this recording."
+            )
+
     def _find_chunks(self, session_id: str) -> list[ChunkInfo]:
         fields = "id,name,size,parents,appProperties"
         raw_files = self._client.find_files_by_app_property("sessionId", session_id, fields)
@@ -185,10 +258,10 @@ class SessionReconstructor:
             name = entry.get("name", "<unknown>")
             file_id = entry["id"]
 
-            # Phase 6's session-completion marker (and any future master/proxy
-            # lookup by sessionId) shares the same sessionId tag but is explicitly
-            # kind-tagged and never a chunk -- skip it rather than treating its
-            # absent chunkIndex as corruption.
+            # Phase 6's session-completion marker (and the project master/proxy,
+            # which also carry a sessionId tag via latestSessionId lookups
+            # elsewhere) share tags but are never chunks -- skip by kind rather
+            # than treating their absent chunkIndex as corruption.
             if props.get("kind") in ("session_complete", "master", "proxy"):
                 continue
 

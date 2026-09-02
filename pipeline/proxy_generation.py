@@ -19,13 +19,19 @@ CPU; if hardware decode isn't available or fails, this falls back to plain
 software decode+encode rather than failing the job.
 
 Filename convention for Resolve auto-relink: the proxy keeps the exact same
-filename stem as the master (only the extension changes, e.g.
-"<sessionId>_master.mp4" -> "<sessionId>_master.mov"). Resolve's Project
+filename stem as the project's master (only the extension changes, e.g.
+"<projectName>_master.mp4" -> "<projectName>_master.mov"). Resolve's Project
 Settings -> Master Project Settings -> "Proxy media path" links proxies to
 their originals by matching filename stem regardless of extension — once
 that setting points at this project's local (Drive-synced) Proxy/ folder,
 same-named files there are picked up automatically, without a manual "Link
 Proxy Media" pass per clip.
+
+One proxy per PROJECT (matching the master), not per session: since Phase 4
+now appends every new session's footage onto one growing project master
+rather than creating a separate master per session, the proxy is regenerated
+in full from the updated master each time and replaces the previous proxy's
+content in place (same Drive file id) rather than creating a new file.
 """
 
 import shutil
@@ -37,11 +43,7 @@ from typing import Callable
 from pipeline import ffmpeg_tools
 from pipeline.drive_client import DriveClient
 from pipeline.drive_desktop import find_local_drive_root, wait_for_local_sync
-from pipeline.errors import (
-    MasterNotFoundError,
-    ProxyAlreadyExistsError,
-    ProxyValidationError,
-)
+from pipeline.errors import MasterNotFoundError, ProxyValidationError
 
 DURATION_TOLERANCE_SECONDS = 2.0
 DURATION_TOLERANCE_FRACTION = 0.02
@@ -67,17 +69,14 @@ class ProxyGenerator:
         self._on_progress = on_progress or (lambda _msg: None)
 
     def generate_for_session(self, session_id: str) -> ProxyResult:
+        """Regenerates the PROJECT's proxy in full from its current master —
+        session_id just identifies which reconstruction run triggered this;
+        the resulting proxy always covers the whole project master, not only
+        this session's slice of it."""
         ffmpeg_tools.check_available()
 
         self._progress(f"Looking up reconstructed master for session '{session_id}'...")
         master = self._find_master(session_id)
-
-        existing_proxy = self._find_existing_proxy(session_id)
-        if existing_proxy:
-            raise ProxyAlreadyExistsError(
-                f"A proxy for session '{session_id}' already exists in Drive "
-                f"(id={existing_proxy['id']}). Delete it first if you want to regenerate it."
-            )
 
         original_folder_id = master["parents"][0]
         original_folder = self._client.get_file(original_folder_id, fields="id, name, parents")
@@ -87,6 +86,7 @@ class ProxyGenerator:
 
         master_stem = Path(master["name"]).stem
         proxy_name = f"{master_stem}.mov"
+        existing_proxy = self._client.find_file(proxy_name, proxy_folder["id"])
 
         temp_dir = Path(tempfile.mkdtemp(prefix=f"cloudrecorder_proxy_{session_id}_"))
         try:
@@ -133,14 +133,29 @@ class ProxyGenerator:
                 )
 
             proxy_size = proxy_path.stat().st_size
+            app_properties = {
+                "kind": "proxy",
+                "projectName": project_folder["name"],
+                "latestSessionId": session_id,
+                "masterFileId": master["id"],
+            }
 
-            self._progress(f"Uploading proxy '{proxy_name}' to Drive...")
-            proxy_file_id = self._client.upload_file(
-                proxy_path, proxy_folder["id"], proxy_name,
-                mime_type="video/quicktime",
-                progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
-                app_properties={"sessionId": session_id, "kind": "proxy", "masterFileId": master["id"]},
-            )
+            if existing_proxy:
+                self._progress(f"Updating proxy '{proxy_name}' in place in Drive...")
+                proxy_file_id = self._client.update_file_content(
+                    existing_proxy["id"], proxy_path,
+                    mime_type="video/quicktime",
+                    progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
+                    app_properties=app_properties,
+                )
+            else:
+                self._progress(f"Uploading proxy '{proxy_name}' to Drive...")
+                proxy_file_id = self._client.upload_file(
+                    proxy_path, proxy_folder["id"], proxy_name,
+                    mime_type="video/quicktime",
+                    progress_callback=lambda frac: self._progress(f"  upload progress: {frac * 100:.0f}%"),
+                    app_properties=app_properties,
+                )
 
             local_root = find_local_drive_root()
             local_path = None
@@ -168,8 +183,11 @@ class ProxyGenerator:
         self._on_progress(message)
 
     def _find_master(self, session_id: str) -> dict:
+        """Finds the project master most recently updated by this session's
+        reconstruction — tagged latestSessionId, not sessionId, since one
+        project master now accumulates many sessions' footage over time."""
         fields = "id, name, parents, appProperties"
-        candidates = self._client.find_files_by_app_property("sessionId", session_id, fields)
+        candidates = self._client.find_files_by_app_property("latestSessionId", session_id, fields)
         masters = [f for f in candidates if _kind(f) == "master"]
         if not masters:
             raise MasterNotFoundError(
@@ -178,23 +196,34 @@ class ProxyGenerator:
             )
         return masters[0]
 
-    def _find_existing_proxy(self, session_id: str) -> dict | None:
-        fields = "id, name, appProperties"
-        candidates = self._client.find_files_by_app_property("sessionId", session_id, fields)
-        proxies = [f for f in candidates if _kind(f) == "proxy"]
-        return proxies[0] if proxies else None
-
 
 def find_sessions_needing_proxy(client: DriveClient) -> list[str]:
-    """Returns session IDs that have a reconstructed master but no proxy yet."""
+    """Returns the latestSessionId of every project master whose proxy is
+    missing or stale (i.e. doesn't reflect that master's most recent append) —
+    the session id doubles as the trigger to re-run generate_for_session,
+    which always regenerates the whole project's proxy from the current
+    master regardless of which session id triggered it."""
     fields = "id, appProperties"
-    all_tagged = client.find_files_by_app_property("kind", "master", fields)
-    master_sessions = {f["appProperties"]["sessionId"] for f in all_tagged if f.get("appProperties", {}).get("sessionId")}
+    masters = client.find_files_by_app_property("kind", "master", fields)
+    proxies = client.find_files_by_app_property("kind", "proxy", fields)
 
-    proxied = client.find_files_by_app_property("kind", "proxy", fields)
-    proxy_sessions = {f["appProperties"]["sessionId"] for f in proxied if f.get("appProperties", {}).get("sessionId")}
+    proxy_latest_by_project = {
+        p["appProperties"]["projectName"]: p["appProperties"].get("latestSessionId")
+        for p in proxies
+        if p.get("appProperties", {}).get("projectName")
+    }
 
-    return sorted(master_sessions - proxy_sessions)
+    needing: list[str] = []
+    for m in masters:
+        props = m.get("appProperties") or {}
+        project_name = props.get("projectName")
+        latest_session_id = props.get("latestSessionId")
+        if not project_name or not latest_session_id:
+            continue
+        if proxy_latest_by_project.get(project_name) != latest_session_id:
+            needing.append(latest_session_id)
+
+    return sorted(needing)
 
 
 def _kind(file_entry: dict) -> str | None:
